@@ -500,6 +500,7 @@ class ExportViewModel: ObservableObject {
             var attachmentPaths: [String: String] = [:]
             let inlineImageAttachments = note.attachments.filter {
                 HTMLAttachmentProcessor.isInlineImageType($0.typeUTI)
+                    && $0.typeUTI != "com.apple.notes.gallery"
             }
             if !inlineImageAttachments.isEmpty {
                 // Stage only image sources that may be needed to render inline.

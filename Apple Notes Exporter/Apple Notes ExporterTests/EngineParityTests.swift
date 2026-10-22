@@ -355,6 +355,8 @@ final class EngineParityTests: XCTestCase {
     }
 
     func test_standaloneProcessorLabelsFileReferencesAndExternalLinksHonestly() throws {
+        XCTAssertTrue(HTMLAttachmentProcessor.isInlineImageType("com.apple.notes.gallery"),
+                      "Legacy exports keep their existing gallery-as-image classification.")
         let db = try openAttachmentTestDatabase()
         defer { sqlite3_close(db) }
         let processor = HTMLAttachmentProcessor(database: db)

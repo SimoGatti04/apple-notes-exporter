@@ -51,7 +51,8 @@ class HTMLAttachmentProcessor {
         typeUTI.hasPrefix("com.compuserve.gif") ||
         typeUTI == "com.apple.paper" ||
         typeUTI == "com.apple.drawing" ||
-        typeUTI == "com.apple.drawing.2"
+        typeUTI == "com.apple.drawing.2" ||
+        typeUTI == "com.apple.notes.gallery"
     }
 
     /// Process HTML to replace attachment markers with actual content
