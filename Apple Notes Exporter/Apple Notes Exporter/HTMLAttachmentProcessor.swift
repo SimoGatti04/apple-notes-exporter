@@ -51,8 +51,7 @@ class HTMLAttachmentProcessor {
         typeUTI.hasPrefix("com.compuserve.gif") ||
         typeUTI == "com.apple.paper" ||
         typeUTI == "com.apple.drawing" ||
-        typeUTI == "com.apple.drawing.2" ||
-        typeUTI == "com.apple.notes.gallery"
+        typeUTI == "com.apple.drawing.2"
     }
 
     /// Process HTML to replace attachment markers with actual content
@@ -173,6 +172,18 @@ class HTMLAttachmentProcessor {
         linkEmbeddedImages: Bool,
         standalonePDF: Bool
     ) -> String {
+        // A Notes gallery is a collection, not one raster image. The current
+        // single-PDF path cannot render every child image in its original order,
+        // so show an explicit incomplete reference rather than silently using
+        // only the first staged child as if it represented the whole gallery.
+        if standalonePDF && attachment.typeUTI == "com.apple.notes.gallery" {
+            markIncomplete(attachment, reason: "the gallery’s original images are not all rendered in the standalone PDF")
+            return generateStandaloneFileReferenceHTML(
+                filename: attachment.filename ?? "Image gallery",
+                description: "Original gallery images not fully rendered or embedded"
+            )
+        }
+
         // Check if this is an image
         // Also treat drawings/sketches as images since they have fallback image data
         if Self.isInlineImageType(attachment.typeUTI) {

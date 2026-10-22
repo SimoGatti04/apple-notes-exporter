@@ -363,6 +363,7 @@ final class EngineParityTests: XCTestCase {
             NotesAttachment(id: "word-1", typeUTI: "org.openxmlformats.wordprocessingml.document", filename: "letter.docx"),
             NotesAttachment(id: "markdown-1", typeUTI: "net.daringfireball.markdown", filename: "readme.md"),
             NotesAttachment(id: "generic-1", typeUTI: "com.example.binary", filename: "data.bin"),
+            NotesAttachment(id: "gallery-1", typeUTI: "com.apple.notes.gallery", filename: "Photos"),
             NotesAttachment(id: "web-link", typeUTI: "public.url", filename: "External guide"),
             NotesAttachment(id: "missing-link", typeUTI: "public.url", filename: "Missing link")
         ]
@@ -391,10 +392,12 @@ final class EngineParityTests: XCTestCase {
         }
         XCTAssertTrue(result.contains("Word Document"))
         XCTAssertTrue(result.contains("Markdown Document"))
+        XCTAssertTrue(result.contains("Original gallery images not fully rendered or embedded"))
+        XCTAssertTrue(result.contains("Photos"))
         XCTAssertTrue(result.contains("https://example.test/guide"))
         XCTAssertTrue(processor.notices.contains { $0.contains("not downloaded or embedded") })
-        XCTAssertEqual(processor.incompleteAttachmentIDs, Set(["pdf-1", "word-1", "markdown-1", "generic-1", "missing-link"]))
-        XCTAssertEqual(processor.diagnostics.count, 5)
+        XCTAssertEqual(processor.incompleteAttachmentIDs, Set(["pdf-1", "word-1", "markdown-1", "generic-1", "gallery-1", "missing-link"]))
+        XCTAssertEqual(processor.diagnostics.count, 6)
     }
 
     func test_standaloneProcessorReportsUnavailableImageWithoutStagingLink() throws {
