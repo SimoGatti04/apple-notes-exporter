@@ -19,6 +19,7 @@
 //
 
 import Foundation
+import CoreGraphics
 import OSLog
 import Darwin
 import UniformTypeIdentifiers
@@ -716,7 +717,786 @@ func noteHTMLDocument(
     """
 }
 
-/// How the intermediate HTML should be generated for a given target format.
+// MARK: - PDF Layout and Typography Engine
+
+/// Layout profiles supported by the enhanced PDF styling engine.
+public enum PDFStyleProfile: String, CaseIterable, Codable, Sendable {
+    /// Reproduces the visual aesthetics, colors, and typography recognized by Apple Notes.
+    /// Preserves Apple Notes font hierarchies, standard monostyle blocks with subtle borders,
+    /// soft yellow/palette highlights, clean table borders, and standard list formatting.
+    case faithful = "faithful"
+
+    /// An optimized, highly legible layout engineered for reading, studying, and printing on A4/Letter.
+    /// Features comfortable line-height (1.58), clear heading hierarchy with subtle section accents,
+    /// elegant technical monostyle callouts with accent bars, centered and proportional images,
+    /// soft pastel highlights, styled tables with zebra rows and header repetition, and strict
+    /// page-break controls to prevent orphaned headings, sliced images, or cut table rows.
+    case study = "study"
+
+    /// User-facing display name.
+    public var displayName: String {
+        switch self {
+        case .faithful: return "Faithful"
+        case .study: return "Study"
+        }
+    }
+
+    /// Descriptive explanation of the profile's characteristics.
+    public var description: String {
+        switch self {
+        case .faithful:
+            return "Faithful to Apple Notes: preserves native typography, monostyle, highlights, and note layout."
+        case .study:
+            return "Study Guide: clean A4 layout, comfortable line-height, centered proportional images, and page-break protection."
+        }
+    }
+}
+
+/// Compatibility alias matching both naming conventions.
+public typealias PDFLayoutProfile = PDFStyleProfile
+
+/// Configuration options for PDF layout rendering.
+public struct PDFDocumentOptions: Sendable, Equatable {
+    /// The target visual styling profile (faithful or study).
+    public var profile: PDFStyleProfile
+    /// Paper size in points (e.g. A4 is 595 x 842 pt; Letter is 612 x 792 pt).
+    public var pageSize: CGSize
+    /// Margin insets in points (top, left, bottom, right).
+    public var pageMargins: NSEdgeInsets
+    /// Optional font family override (CSS font-family string). If nil, profile default is used.
+    public var fontFamily: String?
+    /// Base font size in points. If nil, profile default is used.
+    public var baseFontSizePoints: Double?
+    /// Optional custom accent color (hex/rgb string, e.g. "#2563eb").
+    public var accentColor: String?
+    /// Whether to force image centering (if nil, uses profile default: true for study, false for faithful).
+    public var centerImages: Bool?
+    /// Maximum image width as percentage of printable width (if nil, uses profile default: 85% for study, 100% for faithful).
+    public var maxImageWidthPercent: Double?
+    /// When true, @page margin in CSS sets the page margins directly. When false (default), CSS assumes margins are handled by the print runner (e.g. NSPrintInfo in HtmlToPdf).
+    public var embedPageMarginsInCSS: Bool
+    /// Whether to include document metadata header (e.g. title/date badge).
+    public var showHeader: Bool
+    /// Additional custom CSS rules to inject if needed.
+    public var customCSS: String?
+
+    public init(
+        profile: PDFStyleProfile = .study,
+        pageSize: CGSize = CGSize(width: 595, height: 842),
+        pageMargins: NSEdgeInsets = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36),
+        fontFamily: String? = nil,
+        baseFontSizePoints: Double? = nil,
+        accentColor: String? = nil,
+        centerImages: Bool? = nil,
+        maxImageWidthPercent: Double? = nil,
+        embedPageMarginsInCSS: Bool = false,
+        showHeader: Bool = false,
+        customCSS: String? = nil
+    ) {
+        self.profile = profile
+        self.pageSize = pageSize
+        self.pageMargins = pageMargins
+        self.fontFamily = fontFamily
+        self.baseFontSizePoints = baseFontSizePoints
+        self.accentColor = accentColor
+        self.centerImages = centerImages
+        self.maxImageWidthPercent = maxImageWidthPercent
+        self.embedPageMarginsInCSS = embedPageMarginsInCSS
+        self.showHeader = showHeader
+        self.customCSS = customCSS
+    }
+
+    public static func == (lhs: PDFDocumentOptions, rhs: PDFDocumentOptions) -> Bool {
+        lhs.profile == rhs.profile &&
+        lhs.pageSize.width == rhs.pageSize.width &&
+        lhs.pageSize.height == rhs.pageSize.height &&
+        lhs.pageMargins.top == rhs.pageMargins.top &&
+        lhs.pageMargins.left == rhs.pageMargins.left &&
+        lhs.pageMargins.bottom == rhs.pageMargins.bottom &&
+        lhs.pageMargins.right == rhs.pageMargins.right &&
+        lhs.fontFamily == rhs.fontFamily &&
+        lhs.baseFontSizePoints == rhs.baseFontSizePoints &&
+        lhs.accentColor == rhs.accentColor &&
+        lhs.centerImages == rhs.centerImages &&
+        lhs.maxImageWidthPercent == rhs.maxImageWidthPercent &&
+        lhs.embedPageMarginsInCSS == rhs.embedPageMarginsInCSS &&
+        lhs.showHeader == rhs.showHeader &&
+        lhs.customCSS == rhs.customCSS
+    }
+
+    /// Default configuration for Study profile on A4 paper.
+    public static var a4Study: PDFDocumentOptions {
+        PDFDocumentOptions(
+            profile: .study,
+            pageSize: CGSize(width: 595, height: 842),
+            pageMargins: NSEdgeInsets(top: 40, left: 40, bottom: 40, right: 40),
+            baseFontSizePoints: 10.5,
+            centerImages: true,
+            maxImageWidthPercent: 85.0
+        )
+    }
+
+    /// Default configuration for Faithful profile on A4 paper.
+    public static var a4Faithful: PDFDocumentOptions {
+        PDFDocumentOptions(
+            profile: .faithful,
+            pageSize: CGSize(width: 595, height: 842),
+            pageMargins: NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36),
+            baseFontSizePoints: 11.0,
+            centerImages: false,
+            maxImageWidthPercent: 100.0
+        )
+    }
+}
+
+/// Compatibility alias matching both naming conventions.
+public typealias PDFLayoutOptions = PDFDocumentOptions
+
+/// Generates CSS constraint for maximum image height based on page size and margins.
+public func pdfImageConstraint(
+    profile: PDFStyleProfile,
+    pageSize: CGSize? = nil,
+    margins: NSEdgeInsets? = nil
+) -> String {
+    let printableHeight: CGFloat
+    if let pageSize, let margins {
+        printableHeight = max(100, pageSize.height - margins.top - margins.bottom - 20)
+    } else {
+        printableHeight = 750
+    }
+
+    switch profile {
+    case .faithful:
+        return "max-height: \(printableHeight)pt; height: auto;"
+    case .study:
+        let studyMaxHeight = min(380, max(120, printableHeight * 0.48))
+        return "max-height: \(studyMaxHeight)pt; height: auto;"
+    }
+}
+
+/// Generates the standalone CSS stylesheet for the requested PDF layout profile and options.
+public func pdfDocumentCSS(options: PDFDocumentOptions) -> String {
+    let profile = options.profile
+    let safeMaxHeight: CGFloat
+    if profile == .study {
+        let printableHeight = max(100, options.pageSize.height - options.pageMargins.top - options.pageMargins.bottom - 20)
+        safeMaxHeight = min(380, max(120, printableHeight * 0.48))
+    } else {
+        safeMaxHeight = max(100, options.pageSize.height - options.pageMargins.top - options.pageMargins.bottom - 20)
+    }
+
+    let shouldCenterImages = options.centerImages ?? (profile == .study)
+    let maxImageWidth = options.maxImageWidthPercent ?? (profile == .study ? 85.0 : 100.0)
+
+    let pageMarginRule: String
+    if options.embedPageMarginsInCSS {
+        pageMarginRule = "margin: \(options.pageMargins.top)pt \(options.pageMargins.right)pt \(options.pageMargins.bottom)pt \(options.pageMargins.left)pt;"
+    } else {
+        pageMarginRule = "margin: 0;"
+    }
+
+    switch profile {
+    case .faithful:
+        let fontFamily = options.fontFamily ?? "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        let fontSize = options.baseFontSizePoints ?? 11.0
+        let linkColor = options.accentColor ?? "#0071e3"
+
+        return """
+        /* Apple Notes Exporter — Faithful PDF Profile */
+        @page {
+            size: \(options.pageSize.width)pt \(options.pageSize.height)pt;
+            \(pageMarginRule)
+        }
+        *, *:before, *:after {
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+            box-sizing: border-box;
+        }
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #ffffff;
+            color: #000000;
+            font-family: \(fontFamily);
+            font-size: \(fontSize)pt;
+            line-height: 1.4;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            -webkit-text-size-adjust: 100%;
+        }
+        .ane-content {
+            padding: 0;
+            margin: 0;
+        }
+
+        /* Headings */
+        h1, h2, h3, h4, h5, h6 {
+            color: #000000;
+            break-after: avoid !important;
+            page-break-after: avoid !important;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        h1 {
+            font-size: 20pt;
+            font-weight: 700;
+            margin: 0.5em 0 0.35em 0;
+            line-height: 1.25;
+        }
+        h2 {
+            font-size: 15pt;
+            font-weight: 600;
+            margin: 0.6em 0 0.3em 0;
+            line-height: 1.3;
+        }
+        h3 {
+            font-size: 12.5pt;
+            font-weight: 600;
+            margin: 0.5em 0 0.25em 0;
+            line-height: 1.35;
+        }
+        p {
+            margin: 0 0 0.5em 0;
+            line-height: 1.4;
+            orphans: 2;
+            widows: 2;
+        }
+
+        /* Monostile */
+        pre, pre.ane-monostyle, .ane-monostyle {
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace !important;
+            font-size: 0.92em !important;
+            line-height: 1.42 !important;
+            background-color: #f4f4f6 !important;
+            border: 1px solid #e5e5ea !important;
+            border-radius: 6px !important;
+            padding: 8px 12px !important;
+            margin: 8px 0 12px 0 !important;
+            white-space: pre-wrap !important;
+            word-wrap: break-word !important;
+            overflow-wrap: break-word !important;
+            tab-size: 4;
+            -moz-tab-size: 4;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+            color: #000000 !important;
+        }
+        code {
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+            font-size: 0.9em;
+            background-color: #f0f0f2;
+            padding: 1.5px 4px;
+            border-radius: 3px;
+        }
+
+        /* Highlights */
+        mark, .ane-highlight {
+            background-color: #ffe58f !important;
+            color: inherit;
+            padding: 0.1em 0.25em;
+            border-radius: 3px;
+            -webkit-box-decoration-break: clone;
+            box-decoration-break: clone;
+        }
+        .ane-highlight-yellow { background-color: #ffe58f !important; }
+        .ane-highlight-amber, .ane-highlight-orange { background-color: #ffd591 !important; }
+        .ane-highlight-pink, .ane-highlight-red { background-color: #ffadd2 !important; }
+        .ane-highlight-purple { background-color: #d3adf7 !important; }
+        .ane-highlight-blue { background-color: #bae7ff !important; }
+        .ane-highlight-green, .ane-highlight-mint { background-color: #b7eb8f !important; }
+        .ane-highlight-gray { background-color: #e8e8e8 !important; }
+
+        /* Text colors */
+        .ane-color-yellow { color: #b45309 !important; }
+        .ane-color-green { color: #15803d !important; }
+        .ane-color-pink { color: #be185d !important; }
+        .ane-color-purple { color: #7e22ce !important; }
+        .ane-color-blue { color: #1d4ed8 !important; }
+        .ane-color-gray { color: #6b7280 !important; }
+        .ane-color-orange { color: #c2410c !important; }
+        .ane-color-red { color: #b91c1c !important; }
+
+        /* Lists */
+        ul, ol {
+            margin: 0.3em 0 0.6em 0;
+            padding-left: 1.5em;
+        }
+        li {
+            margin: 0.15em 0;
+            line-height: 1.4;
+        }
+        ul[style*="list-style-type: none"], ul.ane-checklist {
+            padding-left: 0.4em;
+            list-style: none;
+        }
+
+        /* Tables */
+        table, .ane-table {
+            border-collapse: collapse !important;
+            width: 100%;
+            margin: 12px 0 16px 0;
+            break-inside: auto;
+            page-break-inside: auto;
+        }
+        thead {
+            display: table-header-group;
+        }
+        tr {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        td, th {
+            border: 1px solid #d2d2d7 !important;
+            padding: 6px 10px !important;
+            text-align: left;
+            vertical-align: top;
+            line-height: 1.35;
+        }
+        th {
+            background-color: #f7f7f8 !important;
+            font-weight: 600;
+        }
+
+        /* Images */
+        img {
+            max-width: \(maxImageWidth)% !important;
+            max-height: \(safeMaxHeight)pt !important;
+            height: auto !important;
+            display: block;
+            margin: \(shouldCenterImages ? "12px auto" : "10px 0") !important;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+            object-fit: contain;
+            border-radius: 4px;
+        }
+        a:has(> img), .ane-image-container {
+            display: block;
+            \(shouldCenterImages ? "text-align: center; margin: 12px auto;" : "margin: 10px 0;")
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+
+        /* Links & Cards */
+        a {
+            color: \(linkColor);
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+        div[style*="border: 1px solid"], .ane-url-card, .ane-attachment {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+            margin: 8px 0;
+        }
+
+        /* Paging utilities */
+        .page-break, .page-break-before {
+            break-before: page !important;
+            page-break-before: always !important;
+        }
+        .page-break-after {
+            break-after: page !important;
+            page-break-after: always !important;
+        }
+        .no-break, .keep-together {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        \(options.customCSS ?? "")
+        """
+
+    case .study:
+        let fontFamily = options.fontFamily ?? "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+        let fontSize = options.baseFontSizePoints ?? 10.5
+        let accentColor = options.accentColor ?? "#2563eb"
+
+        return """
+        /* Apple Notes Exporter — Study PDF Profile */
+        @page {
+            size: \(options.pageSize.width)pt \(options.pageSize.height)pt;
+            \(pageMarginRule)
+        }
+        *, *:before, *:after {
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+            box-sizing: border-box;
+        }
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #ffffff;
+            color: #1e293b;
+            font-family: \(fontFamily);
+            font-size: \(fontSize)pt;
+            line-height: 1.58;
+            letter-spacing: 0.005em;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            -webkit-text-size-adjust: 100%;
+        }
+        .ane-content {
+            padding: 0;
+            margin: 0;
+        }
+
+        /* Headings Hierarchy */
+        h1, h2, h3, h4, h5, h6 {
+            color: #0f172a;
+            break-after: avoid !important;
+            page-break-after: avoid !important;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        h1 {
+            font-size: 21pt;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1.25;
+            margin: 1.5em 0 0.5em 0;
+            padding-bottom: 0.25em;
+            border-bottom: 2px solid #e2e8f0;
+            letter-spacing: -0.02em;
+        }
+        h1:first-child, .ane-content > h1:first-child {
+            margin-top: 0;
+        }
+        h2 {
+            font-size: 15pt;
+            font-weight: 600;
+            color: #1e293b;
+            line-height: 1.3;
+            margin: 1.35em 0 0.45em 0;
+            padding-bottom: 0.18em;
+            border-bottom: 1px solid #f1f5f9;
+            letter-spacing: -0.01em;
+        }
+        h3 {
+            font-size: 12.5pt;
+            font-weight: 600;
+            color: #334155;
+            line-height: 1.35;
+            margin: 1.1em 0 0.35em 0;
+        }
+        p {
+            margin: 0 0 0.85em 0;
+            line-height: 1.58;
+            orphans: 3;
+            widows: 3;
+        }
+
+        /* Monostile Callout */
+        pre, pre.ane-monostyle, .ane-monostyle {
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+            font-size: 0.88em !important;
+            line-height: 1.5 !important;
+            background-color: #f8fafc !important;
+            border: 1px solid #e2e8f0 !important;
+            border-left: 3.5px solid \(accentColor) !important;
+            border-radius: 6px !important;
+            padding: 10px 14px !important;
+            margin: 12px 0 16px 0 !important;
+            color: #0f172a !important;
+            white-space: pre-wrap !important;
+            word-wrap: break-word !important;
+            overflow-wrap: break-word !important;
+            tab-size: 4;
+            -moz-tab-size: 4;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        code {
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+            font-size: 0.88em;
+            background-color: #f1f5f9;
+            color: #0f172a;
+            padding: 1.5px 5px;
+            border-radius: 4px;
+            border: 1px solid #e2e8f0;
+        }
+
+        /* Highlights */
+        mark, .ane-highlight {
+            background-color: #fef08a !important;
+            color: inherit;
+            padding: 0.12em 0.35em;
+            border-radius: 3px;
+            -webkit-box-decoration-break: clone;
+            box-decoration-break: clone;
+        }
+        .ane-highlight-yellow { background-color: #fef08a !important; }
+        .ane-highlight-amber, .ane-highlight-orange { background-color: #fed7aa !important; }
+        .ane-highlight-pink, .ane-highlight-red { background-color: #fbcfe8 !important; }
+        .ane-highlight-purple { background-color: #e9d5ff !important; }
+        .ane-highlight-blue { background-color: #bfdbfe !important; }
+        .ane-highlight-green, .ane-highlight-mint { background-color: #bbf7d0 !important; }
+        .ane-highlight-gray { background-color: #e2e8f0 !important; }
+
+        /* Text colors */
+        .ane-color-yellow { color: #b45309 !important; }
+        .ane-color-green { color: #15803d !important; }
+        .ane-color-pink { color: #be185d !important; }
+        .ane-color-purple { color: #7e22ce !important; }
+        .ane-color-blue { color: #1d4ed8 !important; }
+        .ane-color-gray { color: #64748b !important; }
+        .ane-color-orange { color: #c2410c !important; }
+        .ane-color-red { color: #b91c1c !important; }
+
+        /* Lists */
+        ul, ol {
+            margin: 0.5em 0 0.85em 0;
+            padding-left: 1.6em;
+        }
+        li {
+            margin-bottom: 0.3em;
+            line-height: 1.58;
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }
+        ul[style*="list-style-type: none"], ul.ane-checklist {
+            padding-left: 0.4em;
+            list-style: none;
+        }
+
+        /* Tables with Row Page-Break Avoidance & Zebra Striping */
+        table, .ane-table {
+            border-collapse: collapse !important;
+            width: 100%;
+            margin: 16px 0 20px 0;
+            border: 1px solid #cbd5e1 !important;
+            border-radius: 6px;
+            overflow: hidden;
+            break-inside: auto;
+            page-break-inside: auto;
+        }
+        thead {
+            display: table-header-group;
+        }
+        tr {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        table tr:first-child td, table th {
+            background-color: #f1f5f9 !important;
+            font-weight: 600 !important;
+            color: #0f172a;
+            border-bottom: 2px solid #cbd5e1 !important;
+        }
+        td, th {
+            border: 1px solid #e2e8f0 !important;
+            padding: 8px 12px !important;
+            text-align: left;
+            vertical-align: top;
+            line-height: 1.45;
+            font-size: 0.95em;
+        }
+        table tr:nth-child(even):not(:first-child) td {
+            background-color: #f8fafc;
+        }
+
+        /* Centered & Proportional Images */
+        img {
+            display: block !important;
+            margin: 18px auto !important;
+            max-width: \(maxImageWidth)% !important;
+            max-height: \(safeMaxHeight)pt !important;
+            height: auto !important;
+            width: auto !important;
+            object-fit: contain;
+            border-radius: 6px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        a:has(> img), .ane-image-container {
+            display: block;
+            text-align: center;
+            margin: 18px auto;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+
+        /* Links & Cards */
+        a {
+            color: \(accentColor);
+            text-decoration: none;
+            border-bottom: 1px solid #93c5fd;
+            padding-bottom: 0.5px;
+        }
+        div[style*="border: 1px solid"], .ane-url-card, .ane-attachment {
+            border: 1px solid #e2e8f0 !important;
+            background-color: #f8fafc !important;
+            border-radius: 8px !important;
+            padding: 10px 14px !important;
+            margin: 10px 0 14px 0 !important;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+        }
+
+        /* Paging utilities */
+        .page-break, .page-break-before {
+            break-before: page !important;
+            page-break-before: always !important;
+        }
+        .page-break-after {
+            break-after: page !important;
+            page-break-after: always !important;
+        }
+        .no-break, .keep-together {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        \(options.customCSS ?? "")
+        """
+    }
+}
+
+/// Convenience overload for pdfDocumentCSS using default options for the given profile, paper size, and margins.
+public func pdfDocumentCSS(
+    profile: PDFStyleProfile,
+    fontFamily: String? = nil,
+    fontSize: String? = nil,
+    pageSize: CGSize = CGSize(width: 595, height: 842),
+    margins: NSEdgeInsets = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36)
+) -> String {
+    var options = PDFDocumentOptions(profile: profile, pageSize: pageSize, pageMargins: margins)
+    if let fontFamily, !fontFamily.isEmpty { options.fontFamily = fontFamily }
+    if let fontSize, let parsedSize = Double(fontSize.replacingOccurrences(of: "pt", with: "").trimmingCharacters(in: .whitespaces)) {
+        options.baseFontSizePoints = parsedSize
+    }
+    return pdfDocumentCSS(options: options)
+}
+
+/// Safely extracts the inner content of an HTML document body if full html/body tags are present;
+/// otherwise returns the input string unchanged.
+public func extractHTMLBodyContent(_ html: String) -> String {
+    guard let bodyStart = html.range(of: "<body[^>]*>", options: [.regularExpression, .caseInsensitive]) else {
+        return html
+    }
+    let afterOpen = html[bodyStart.upperBound...]
+    guard let bodyEnd = afterOpen.range(of: "</body>", options: [.caseInsensitive, .backwards]) else {
+        return String(afterOpen).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return String(afterOpen[..<bodyEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Generates a complete, standalone HTML document styled for high-quality PDF rendering
+/// using the specified profile and options.
+public func notePDFHTMLDocument(
+    title: String,
+    created: String = "",
+    modified: String = "",
+    options: PDFDocumentOptions = .a4Study,
+    body: String
+) -> String {
+    let css = pdfDocumentCSS(options: options)
+    let bodyContent = extractHTMLBodyContent(body)
+
+    let headerHTML: String
+    if options.showHeader {
+        let createdMeta = created.isEmpty ? "" : "<span class=\"ane-meta-created\">Created: \(created.htmlEscaped)</span>"
+        let modifiedMeta = modified.isEmpty ? "" : "<span class=\"ane-meta-modified\">Modified: \(modified.htmlEscaped)</span>"
+        let metaRow = [createdMeta, modifiedMeta].filter { !$0.isEmpty }.joined(separator: " • ")
+        headerHTML = """
+        <header class="ane-document-header" style="border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; margin-bottom: 20px; break-inside: avoid;">
+            <h1 class="ane-document-title" style="margin: 0 0 6px 0;">\(title.htmlEscaped)</h1>
+            \(metaRow.isEmpty ? "" : "<div class=\"ane-document-meta\" style=\"font-size: 9pt; color: #64748b;\">\(metaRow)</div>")
+        </header>
+        """
+    } else {
+        headerHTML = ""
+    }
+
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="created" content="\(created)">
+        <meta name="modified" content="\(modified)">
+        <meta name="ane-profile" content="\(options.profile.rawValue)">
+        <title>\(title.htmlEscaped)</title>
+        <style>
+    \(css)
+        </style>
+    </head>
+    <body class="ane-pdf-document ane-profile-\(options.profile.rawValue)">
+        <div class="content ane-content">
+            \(headerHTML)\(bodyContent)
+        </div>
+    </body>
+    </html>
+    """
+}
+
+/// Convenience overload for notePDFHTMLDocument accepting profile, paper size, and margins.
+public func notePDFHTMLDocument(
+    title: String,
+    created: String = "",
+    modified: String = "",
+    profile: PDFStyleProfile = .study,
+    fontFamily: String? = nil,
+    fontSize: String? = nil,
+    pageSize: CGSize = CGSize(width: 595, height: 842),
+    margins: NSEdgeInsets = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36),
+    body: String
+) -> String {
+    var options = PDFDocumentOptions(profile: profile, pageSize: pageSize, pageMargins: margins)
+    if let fontFamily, !fontFamily.isEmpty { options.fontFamily = fontFamily }
+    if let fontSize, let parsedSize = Double(fontSize.replacingOccurrences(of: "pt", with: "").trimmingCharacters(in: .whitespaces)) {
+        options.baseFontSizePoints = parsedSize
+    }
+    return notePDFHTMLDocument(title: title, created: created, modified: modified, options: options, body: body)
+}
+
+/// Compatibility adapter matching noteHTMLDocument parameter style for easy integration into existing export coordinators.
+public func notePDFHTMLDocument(
+    title: String,
+    created: String,
+    modified: String,
+    fontFamily: String?,
+    fontSize: String?,
+    margin: String?,
+    imageConstraint: String?,
+    profile: PDFStyleProfile,
+    pageSize: CGSize? = nil,
+    margins: NSEdgeInsets? = nil,
+    body: String
+) -> String {
+    var options = (profile == .study) ? PDFDocumentOptions.a4Study : PDFDocumentOptions.a4Faithful
+    if let pageSize { options.pageSize = pageSize }
+    if let margins { options.pageMargins = margins }
+    if let fontFamily, !fontFamily.isEmpty { options.fontFamily = fontFamily }
+    if let fontSize, let parsedSize = Double(fontSize.replacingOccurrences(of: "pt", with: "").trimmingCharacters(in: .whitespaces)) {
+        options.baseFontSizePoints = parsedSize
+    }
+    return notePDFHTMLDocument(title: title, created: created, modified: modified, options: options, body: body)
+}
+
+/// Alias for notePDFHTMLDocument supporting alternative integration calls.
+public func pdfHTMLDocument(
+    title: String,
+    created: String = "",
+    modified: String = "",
+    options: PDFDocumentOptions = .a4Study,
+    body: String
+) -> String {
+    notePDFHTMLDocument(title: title, created: created, modified: modified, options: options, body: body)
+}
+
+/// Alias for notePDFHTMLDocument supporting alternative integration calls.
+public func pdfHTMLDocument(
+    title: String,
+    created: String = "",
+    modified: String = "",
+    profile: PDFStyleProfile,
+    pageSize: CGSize = CGSize(width: 595, height: 842),
+    margins: NSEdgeInsets = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36),
+    body: String
+) -> String {
+    notePDFHTMLDocument(title: title, created: created, modified: modified, profile: profile, pageSize: pageSize, margins: margins, body: body)
+}
+
 ///
 /// Most formats want exactly what the user configured. Two do not, and the app
 /// knew that while the CLI did not: `--format markdown` from the CLI wrote

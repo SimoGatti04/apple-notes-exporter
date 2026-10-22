@@ -1675,3 +1675,361 @@ final class ExportSupportTests: XCTestCase {
         XCTAssertTrue(healed.isEmpty)
     }
 }
+
+// MARK: - Agent B: PDF Layout & Typography Engine Tests
+
+import PDFKit
+import WebKit
+import HtmlToPdf
+
+final class SimpleNavDelegate: NSObject, WKNavigationDelegate, @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Error>?
+    
+    func waitForFinish() async throws {
+        try await withCheckedThrowingContinuation { cont in
+            self.continuation = cont
+        }
+    }
+    
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        continuation?.resume()
+        continuation = nil
+    }
+    
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+}
+
+extension ExportSupportTests {
+
+    func test_pdfStyleProfile_enumAndDisplayNames() {
+        XCTAssertEqual(PDFStyleProfile.allCases.count, 2)
+        XCTAssertTrue(PDFStyleProfile.allCases.contains(.faithful))
+        XCTAssertTrue(PDFStyleProfile.allCases.contains(.study))
+
+        XCTAssertEqual(PDFStyleProfile.faithful.displayName, "Faithful")
+        XCTAssertEqual(PDFStyleProfile.study.displayName, "Study")
+
+        XCTAssertFalse(PDFStyleProfile.faithful.description.isEmpty)
+        XCTAssertFalse(PDFStyleProfile.study.description.isEmpty)
+
+        // Typealias check
+        let aliasProfile: PDFLayoutProfile = .study
+        XCTAssertEqual(aliasProfile, PDFStyleProfile.study)
+    }
+
+    func test_pdfDocumentOptions_defaultsAndPresets() {
+        let studyDefault = PDFDocumentOptions.a4Study
+        XCTAssertEqual(studyDefault.profile, .study)
+        XCTAssertEqual(studyDefault.pageSize, CGSize(width: 595, height: 842))
+        XCTAssertEqual(studyDefault.pageMargins.top, 40)
+        XCTAssertEqual(studyDefault.pageMargins.left, 40)
+        XCTAssertEqual(studyDefault.pageMargins.bottom, 40)
+        XCTAssertEqual(studyDefault.pageMargins.right, 40)
+        XCTAssertEqual(studyDefault.baseFontSizePoints, 10.5)
+        XCTAssertEqual(studyDefault.centerImages, true)
+        XCTAssertEqual(studyDefault.maxImageWidthPercent, 85.0)
+
+        let faithfulDefault = PDFDocumentOptions.a4Faithful
+        XCTAssertEqual(faithfulDefault.profile, .faithful)
+        XCTAssertEqual(faithfulDefault.pageSize, CGSize(width: 595, height: 842))
+        XCTAssertEqual(faithfulDefault.pageMargins.top, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.left, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.bottom, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.right, 36)
+        XCTAssertEqual(faithfulDefault.baseFontSizePoints, 11.0)
+        XCTAssertEqual(faithfulDefault.centerImages, false)
+        XCTAssertEqual(faithfulDefault.maxImageWidthPercent, 100.0)
+
+        // Custom options initialization and equality
+        let custom = PDFDocumentOptions(
+            profile: .study,
+            pageSize: CGSize(width: 612, height: 792),
+            pageMargins: NSEdgeInsets(top: 50, left: 50, bottom: 50, right: 50),
+            fontFamily: "Georgia, serif",
+            baseFontSizePoints: 12.0,
+            accentColor: "#10b981",
+            centerImages: true,
+            maxImageWidthPercent: 75.0,
+            embedPageMarginsInCSS: true,
+            showHeader: true,
+            customCSS: "/* custom */"
+        )
+        XCTAssertEqual(custom.profile, .study)
+        XCTAssertEqual(custom.pageSize.width, 612)
+        XCTAssertEqual(custom.pageSize.height, 792)
+        XCTAssertEqual(custom.accentColor, "#10b981")
+        XCTAssertEqual(custom.fontFamily, "Georgia, serif")
+        XCTAssertEqual(custom.baseFontSizePoints, 12.0)
+        XCTAssertTrue(custom.embedPageMarginsInCSS)
+        XCTAssertTrue(custom.showHeader)
+        XCTAssertEqual(custom.customCSS, "/* custom */")
+    }
+
+    func test_pdfImageConstraint_faithfulAndStudy() {
+        let a4Size = CGSize(width: 595, height: 842)
+        let faithfulMargins = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36)
+        let faithfulConstraint = pdfImageConstraint(profile: .faithful, pageSize: a4Size, margins: faithfulMargins)
+        // 842 - 36 - 36 - 20 = 750
+        XCTAssertTrue(faithfulConstraint.contains("max-height: 750.0pt") || faithfulConstraint.contains("max-height: 750pt"))
+        XCTAssertTrue(faithfulConstraint.contains("height: auto;"))
+
+        let studyMargins = NSEdgeInsets(top: 40, left: 40, bottom: 40, right: 40)
+        let studyConstraint = pdfImageConstraint(profile: .study, pageSize: a4Size, margins: studyMargins)
+        // 842 - 40 - 40 - 20 = 742 * 0.48 = ~356.16pt (capped <= 380)
+        XCTAssertTrue(studyConstraint.contains("max-height:"))
+        XCTAssertTrue(studyConstraint.contains("height: auto;"))
+    }
+
+    func test_pdfDocumentCSS_faithful_containsEssentialRules() {
+        let options = PDFDocumentOptions.a4Faithful
+        let css = pdfDocumentCSS(options: options)
+
+        // Apple Notes faithful styling characteristics
+        XCTAssertTrue(css.contains("Apple Notes Exporter — Faithful PDF Profile"))
+        XCTAssertTrue(css.contains("@page"))
+        XCTAssertTrue(css.contains("size: 595.0pt 842.0pt") || css.contains("size: 595pt 842pt"))
+        XCTAssertTrue(css.contains("-webkit-print-color-adjust: exact !important;"))
+
+        // Headings break avoidance
+        XCTAssertTrue(css.contains("page-break-after: avoid !important;"))
+
+        // Monostyle
+        XCTAssertTrue(css.contains("pre, pre.ane-monostyle, .ane-monostyle"))
+        XCTAssertTrue(css.contains("background-color: #f4f4f6 !important;"))
+        XCTAssertTrue(css.contains("border: 1px solid #e5e5ea !important;"))
+        XCTAssertTrue(css.contains("white-space: pre-wrap !important;"))
+
+        // Highlights and colors
+        XCTAssertTrue(css.contains("mark, .ane-highlight"))
+        XCTAssertTrue(css.contains(".ane-highlight-yellow"))
+        XCTAssertTrue(css.contains(".ane-color-blue"))
+        XCTAssertTrue(css.contains(".ane-color-red"))
+
+        // Tables and paging
+        XCTAssertTrue(css.contains("display: table-header-group;"))
+        XCTAssertTrue(css.contains("page-break-inside: avoid !important;"))
+        XCTAssertTrue(css.contains(".page-break"))
+    }
+
+    func test_pdfDocumentCSS_study_containsProfessionalTypography() {
+        let options = PDFDocumentOptions.a4Study
+        let css = pdfDocumentCSS(options: options)
+
+        // Study profile characteristics
+        XCTAssertTrue(css.contains("Apple Notes Exporter — Study PDF Profile"))
+        XCTAssertTrue(css.contains("line-height: 1.58;"))
+        XCTAssertTrue(css.contains("orphans: 3;"))
+        XCTAssertTrue(css.contains("widows: 3;"))
+
+        // Headings hierarchy & accents
+        XCTAssertTrue(css.contains("border-bottom: 1px solid #f1f5f9;"))
+
+        // Monostyle technical callout with accent bar
+        XCTAssertTrue(css.contains("border-left: 3.5px solid #2563eb !important;"))
+        XCTAssertTrue(css.contains("background-color: #f8fafc !important;"))
+
+        // Proportional centered images
+        XCTAssertTrue(css.contains("margin: 18px auto !important;"))
+        XCTAssertTrue(css.contains("max-width: 85.0% !important;") || css.contains("max-width: 85% !important;"))
+        XCTAssertTrue(css.contains("object-fit: contain;"))
+        XCTAssertTrue(css.contains("box-shadow:"))
+
+        // Zebra striped tables
+        XCTAssertTrue(css.contains("table tr:nth-child(even):not(:first-child) td"))
+        XCTAssertTrue(css.contains("background-color: #f8fafc;"))
+        XCTAssertTrue(css.contains("display: table-header-group;"))
+        XCTAssertTrue(css.contains("border: 1px solid #cbd5e1 !important;"))
+
+        // Paging utilities
+        XCTAssertTrue(css.contains(".page-break"))
+        XCTAssertTrue(css.contains(".no-break"))
+    }
+
+    func test_extractHTMLBodyContent_behavior() {
+        // Full html document with body
+        let fullHtml = "<!DOCTYPE html><html><head><title>Doc</title></head><body class=\"test-class\"><p>Hello World</p></body></html>"
+        XCTAssertEqual(extractHTMLBodyContent(fullHtml), "<p>Hello World</p>")
+
+        // Body without attributes
+        let simpleBody = "<body><div>Content here</div></body>"
+        XCTAssertEqual(extractHTMLBodyContent(simpleBody), "<div>Content here</div>")
+
+        // Fragment without body tags should return unmodified
+        let fragment = "<p>Fragment text</p>"
+        XCTAssertEqual(extractHTMLBodyContent(fragment), "<p>Fragment text</p>")
+    }
+
+    func test_notePDFHTMLDocument_faithfulAndStudy_generation() {
+        let body = "<h2>Section Title</h2><p>This is study content with <mark class=\"ane-highlight\">highlights</mark> and <pre class=\"ane-monostyle\">code</pre>.</p>"
+        let title = "Meeting & Notes <Test>"
+        let created = "2026-10-23 10:00:00"
+        let modified = "2026-10-23 11:30:00"
+
+        // Faithful document without header
+        let faithfulDoc = notePDFHTMLDocument(
+            title: title,
+            created: created,
+            modified: modified,
+            options: .a4Faithful,
+            body: body
+        )
+        XCTAssertTrue(faithfulDoc.contains("<!DOCTYPE html>"))
+        XCTAssertTrue(faithfulDoc.contains("<title>Meeting &amp; Notes &lt;Test&gt;</title>"))
+        XCTAssertTrue(faithfulDoc.contains("meta name=\"ane-profile\" content=\"faithful\""))
+        XCTAssertTrue(faithfulDoc.contains("class=\"ane-pdf-document ane-profile-faithful\""))
+        XCTAssertTrue(faithfulDoc.contains("Apple Notes Exporter — Faithful PDF Profile"))
+        XCTAssertTrue(faithfulDoc.contains(body))
+        XCTAssertFalse(faithfulDoc.contains("class=\"ane-document-header\"")) // showHeader is false by default
+
+        // Study document with header enabled
+        var studyOptions = PDFDocumentOptions.a4Study
+        studyOptions.showHeader = true
+        let studyDoc = notePDFHTMLDocument(
+            title: title,
+            created: created,
+            modified: modified,
+            options: studyOptions,
+            body: body
+        )
+        XCTAssertTrue(studyDoc.contains("meta name=\"ane-profile\" content=\"study\""))
+        XCTAssertTrue(studyDoc.contains("class=\"ane-pdf-document ane-profile-study\""))
+        XCTAssertTrue(studyDoc.contains("Apple Notes Exporter — Study PDF Profile"))
+        XCTAssertTrue(studyDoc.contains("<header class=\"ane-document-header\""))
+        XCTAssertTrue(studyDoc.contains("Meeting &amp; Notes &lt;Test&gt;"))
+        XCTAssertTrue(studyDoc.contains("Created: 2026-10-23 10:00:00"))
+        XCTAssertTrue(studyDoc.contains("Modified: 2026-10-23 11:30:00"))
+        XCTAssertTrue(studyDoc.contains(body))
+    }
+
+    func test_backwardCompatibility_existingNoteHTMLDocumentRemainsUnchanged() {
+        // Ensure legacy noteHTMLDocument() is preserved bit-for-bit in behavior
+        let legacyHTML = noteHTMLDocument(
+            title: "Legacy Note",
+            created: "2026-01-01",
+            modified: "2026-01-02",
+            fontFamily: "-apple-system",
+            fontSize: "13px",
+            margin: "0px",
+            imageConstraint: "max-height: 100%;",
+            body: "<p>Original Body</p>"
+        )
+        XCTAssertTrue(legacyHTML.contains("line-height: 1.0;"))
+        XCTAssertTrue(legacyHTML.contains("max-width: 800px;"))
+        XCTAssertTrue(legacyHTML.contains("h1, h2, h3, h4, h5, h6, p { margin: 0; padding: 0; line-height: 1.0; }"))
+        XCTAssertTrue(legacyHTML.contains("<p>Original Body</p>"))
+    }
+
+    @MainActor
+    func test_webKit_renderSyntheticPDF_faithful() async throws {
+        let syntheticTitle = "Faithful Architecture Note"
+        let syntheticBody = """
+        <h1>Faithful Architecture Note</h1>
+        <p>Validating Apple Notes faithful layout with monostyle, colors, and tables.</p>
+        <pre class="ane-monostyle">func processAttachment() -&gt; Bool { return true }</pre>
+        <p>Highlight: <mark class="ane-highlight ane-highlight-yellow">important yellow</mark></p>
+        <p>Status: <span class="ane-color-green">Success</span> and <span class="ane-color-red">Error</span></p>
+        <table class="ane-table"><tr><th>Column A</th><th>Column B</th></tr><tr><td>Cell 1</td><td>Cell 2</td></tr></table>
+        """
+
+        let html = notePDFHTMLDocument(
+            title: syntheticTitle,
+            created: "2026-10-23",
+            options: .a4Faithful,
+            body: syntheticBody
+        )
+
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 595, height: 842))
+        let navDelegate = SimpleNavDelegate()
+        webView.navigationDelegate = navDelegate
+        webView.loadHTMLString(html, baseURL: nil)
+        try await navDelegate.waitForFinish()
+
+        let pdfConfig = WKPDFConfiguration()
+        pdfConfig.rect = CGRect(x: 0, y: 0, width: 595, height: 842)
+
+        let pdfData = try await webView.pdf(configuration: pdfConfig)
+        XCTAssertGreaterThan(pdfData.count, 0)
+
+        guard let doc = PDFDocument(data: pdfData) else {
+            XCTFail("Failed to parse rendered Faithful PDF")
+            return
+        }
+        XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+
+        var fullText = ""
+        for i in 0..<doc.pageCount {
+            if let p = doc.page(at: i), let str = p.string {
+                fullText += str + " "
+            }
+        }
+        XCTAssertTrue(fullText.contains("Faithful Architecture Note"))
+        XCTAssertTrue(fullText.contains("processAttachment"))
+        XCTAssertTrue(fullText.contains("important yellow"))
+        XCTAssertTrue(fullText.contains("Column A"))
+        XCTAssertTrue(fullText.contains("Cell 1"))
+    }
+
+    @MainActor
+    func test_webKit_renderSyntheticPDF_study() async throws {
+        let syntheticTitle = "Study Guide Architecture Note"
+        let syntheticBody = """
+        <h1>Study Guide Architecture Note</h1>
+        <p>Validating study layout with typography, monostyle callout, and page breaks.</p>
+        <pre class="ane-monostyle">struct StudySummary: Sendable { let topic: String }</pre>
+        <p>Highlight: <mark class="ane-highlight ane-highlight-green">key concept</mark></p>
+        <table class="ane-table"><thead><tr><th>Header 1</th><th>Header 2</th></tr></thead><tbody><tr><td>Data 1</td><td>Data 2</td></tr></tbody></table>
+        <div class="page-break"></div>
+        <h2>Page 2 Section</h2>
+        <p>This text is separated by page-break utility.</p>
+        """
+
+        var studyOptions = PDFDocumentOptions.a4Study
+        studyOptions.showHeader = true
+        let html = notePDFHTMLDocument(
+            title: syntheticTitle,
+            created: "2026-10-23 09:30",
+            options: studyOptions,
+            body: syntheticBody
+        )
+
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 595, height: 842))
+        let navDelegate = SimpleNavDelegate()
+        webView.navigationDelegate = navDelegate
+        webView.loadHTMLString(html, baseURL: nil)
+        try await navDelegate.waitForFinish()
+
+        let pdfConfig = WKPDFConfiguration()
+        pdfConfig.rect = CGRect(x: 0, y: 0, width: 595, height: 842)
+
+        let pdfData = try await webView.pdf(configuration: pdfConfig)
+        XCTAssertGreaterThan(pdfData.count, 0)
+
+        guard let doc = PDFDocument(data: pdfData) else {
+            XCTFail("Failed to parse rendered Study PDF")
+            return
+        }
+        XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+
+        var fullText = ""
+        for i in 0..<doc.pageCount {
+            if let p = doc.page(at: i), let str = p.string {
+                fullText += str + " "
+            }
+        }
+        XCTAssertTrue(fullText.contains("Study Guide Architecture Note"))
+        XCTAssertTrue(fullText.contains("Created: 2026-10-23 09:30"))
+        XCTAssertTrue(fullText.contains("StudySummary"))
+        XCTAssertTrue(fullText.contains("key concept"))
+        XCTAssertTrue(fullText.contains("Header 1"))
+        XCTAssertTrue(fullText.contains("Page 2 Section"))
+    }
+}
+
