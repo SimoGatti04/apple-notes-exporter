@@ -28,6 +28,14 @@ enum NoteSortOption: String, CaseIterable {
     case dateCreated = "Date Created"
 }
 
+/// The active scope in the note browser. Search deliberately ignores this scope
+/// so a title can be found without first opening its account or folder.
+enum NoteBrowserScope: Hashable {
+    case allNotes
+    case account(String)
+    case folder(String)
+}
+
 // MARK: - Base Protocol
 
 /// Base protocol for all Notes items (accounts, folders, notes, attachments)
@@ -432,66 +440,102 @@ struct NotesHierarchy {
 
 // MARK: - Selection State
 
-/// Manages note selection state separately from data model
+enum NoteSelectionStatus: Equatable {
+    case none
+    case partial
+    case all
+}
+
+/// Selection is stored by note ID. Folder state is always derived from the
+/// current note IDs, so toggling a note cannot leave stale folder checkmarks.
 struct NotesSelectionState {
     private var selectedNoteIds: Set<String> = []
-    private var selectedFolderIds: Set<String> = []
 
-    /// Check if a note is selected
+    var selectedNoteIDs: Set<String> { selectedNoteIds }
+
     func isNoteSelected(_ noteId: String) -> Bool {
         selectedNoteIds.contains(noteId)
     }
 
-    /// Check if a folder is selected (all notes within it selected)
-    func isFolderSelected(_ folderId: String, in hierarchy: NotesHierarchy) -> Bool {
-        selectedFolderIds.contains(folderId)
+    func selectionStatus(for noteIDs: [String]) -> NoteSelectionStatus {
+        let uniqueIDs = Set(noteIDs)
+        guard !uniqueIDs.isEmpty else { return .none }
+        let selectedCount = uniqueIDs.reduce(into: 0) { count, id in
+            if selectedNoteIds.contains(id) { count += 1 }
+        }
+        if selectedCount == 0 { return .none }
+        return selectedCount == uniqueIDs.count ? .all : .partial
     }
 
-    /// Toggle note selection
+    func isFolderSelected(_ folderId: String, in hierarchy: NotesHierarchy) -> Bool {
+        guard let folder = findFolder(folderId, in: hierarchy.accounts) else { return false }
+        return selectionStatus(for: noteIDs(in: folder)) == .all
+    }
+
     mutating func toggleNote(_ noteId: String) {
-        if selectedNoteIds.contains(noteId) {
+        if !selectedNoteIds.insert(noteId).inserted {
             selectedNoteIds.remove(noteId)
-        } else {
-            selectedNoteIds.insert(noteId)
         }
     }
 
-    /// Select all notes in a folder
+    mutating func setNotes(_ noteIDs: [String], selected: Bool) {
+        if selected {
+            selectedNoteIds.formUnion(noteIDs)
+        } else {
+            selectedNoteIds.subtract(noteIDs)
+        }
+    }
+
+    /// Reconcile the native multi-selection list without dropping selections
+    /// hidden by a search query or a different account/folder scope.
+    mutating func updateVisibleSelection(_ selectedVisibleIDs: Set<String>, visibleIDs: Set<String>) {
+        let hiddenSelection = selectedNoteIds.subtracting(visibleIDs)
+        selectedNoteIds = hiddenSelection.union(selectedVisibleIDs.intersection(visibleIDs))
+    }
+
     mutating func selectFolder(_ folderNode: NotesHierarchy.FolderNode) {
-        // Select all notes in this folder
-        folderNode.notes.forEach { selectedNoteIds.insert($0.id) }
-
-        // Recursively select notes in subfolders
-        folderNode.subfolders.forEach { selectFolder($0) }
-
-        selectedFolderIds.insert(folderNode.folder.id)
+        setNotes(noteIDs(in: folderNode), selected: true)
     }
 
-    /// Deselect all notes in a folder
     mutating func deselectFolder(_ folderNode: NotesHierarchy.FolderNode) {
-        // Deselect all notes in this folder
-        folderNode.notes.forEach { selectedNoteIds.remove($0.id) }
-
-        // Recursively deselect notes in subfolders
-        folderNode.subfolders.forEach { deselectFolder($0) }
-
-        selectedFolderIds.remove(folderNode.folder.id)
+        setNotes(noteIDs(in: folderNode), selected: false)
     }
 
-    /// Get all selected notes
     func selectedNotes(from allNotes: [NotesNote]) -> [NotesNote] {
         allNotes.filter { selectedNoteIds.contains($0.id) }
     }
 
-    /// Get count of selected notes
-    var selectedCount: Int {
-        selectedNoteIds.count
-    }
+    var selectedCount: Int { selectedNoteIds.count }
 
-    /// Clear all selections
     mutating func clearAll() {
         selectedNoteIds.removeAll()
-        selectedFolderIds.removeAll()
+    }
+
+    private func noteIDs(in folder: NotesHierarchy.FolderNode) -> [String] {
+        folder.notes.map(\.id) + folder.subfolders.flatMap { noteIDs(in: $0) }
+    }
+
+    private func findFolder(
+        _ folderId: String,
+        in accounts: [NotesHierarchy.AccountNode]
+    ) -> NotesHierarchy.FolderNode? {
+        for account in accounts {
+            for folder in account.folders {
+                if let match = findFolder(folderId, in: folder) { return match }
+            }
+        }
+        return nil
+    }
+
+    private func findFolder(
+        _ folderId: String,
+        in folder: NotesHierarchy.FolderNode
+    ) -> NotesHierarchy.FolderNode? {
+        if folder.folder.id == folderId { return folder }
+        for child in folder.subfolders {
+            if let match = findFolder(folderId, in: child) { return match }
+        }
+        return nil
     }
 }
 
