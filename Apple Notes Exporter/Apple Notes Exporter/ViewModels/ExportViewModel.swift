@@ -27,11 +27,17 @@ import HtmlToPdf
 
 enum ExportError: Error, LocalizedError {
     case pdfGenerationTimeout
+    case invalidPDFDestinationDirectory(String)
+    case tooManyPDFNameCollisions
 
     var errorDescription: String? {
         switch self {
         case .pdfGenerationTimeout:
             return "PDF generation timed out after 60 seconds. This note may contain many large images or corrupted attachments."
+        case .invalidPDFDestinationDirectory(let name):
+            return "The selected PDF destination is not an existing folder: \(name)"
+        case .tooManyPDFNameCollisions:
+            return "Could not choose an unused filename for the PDF after 10,000 attempts."
         }
     }
 }
@@ -92,6 +98,11 @@ class ExportViewModel: ObservableObject {
     /// Used by generateHTML to rewrite applenotes:note/UUID links to real paths.
     private var internalLinkMap: [String: String] = [:]
 
+    /// Attachments that could not be represented self-contained in the current
+    /// flat-PDF export. The IDs let multiple diagnostics for one attachment be
+    /// reported without inflating the final partial-failure count.
+    private var flatPDFIncompleteAttachmentIDs: Set<String> = []
+
     // MARK: - Concurrency Settings
 
     /// Calculate optimal number of concurrent exports based on system resources
@@ -142,6 +153,39 @@ class ExportViewModel: ObservableObject {
     /// Export notes to the specified output directory
     /// Root name used for both the staging folder and the archive.
     static let zipRootName = exportArchiveRootName
+
+    /// A uniquely created, process-owned staging directory in the system temp
+    /// area. Only a URL returned by `createFlatPDFStagingDirectory` may be
+    /// passed to the matching cleanup helper.
+    private static let flatPDFStagingDirectoryPrefix = "apple-notes-exporter-pdf-"
+
+    private static func createFlatPDFStagingDirectory(
+        under temporaryRoot: URL = FileManager.default.temporaryDirectory,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        let directory = temporaryRoot.appendingPathComponent(
+            flatPDFStagingDirectoryPrefix + UUID().uuidString,
+            isDirectory: true
+        )
+        // Do not use `withIntermediateDirectories`: creation must fail closed
+        // if this supposedly unique path already belongs to somebody else.
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return directory
+    }
+
+    private static func removeFlatPDFStagingDirectory(
+        at directory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard directory.lastPathComponent.hasPrefix(flatPDFStagingDirectoryPrefix) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try fileManager.removeItem(at: directory)
+    }
 
     /// What the finished export actually produced: the archive for a zip
     /// export, otherwise the output folder. The archive name can differ from
@@ -408,6 +452,214 @@ class ExportViewModel: ObservableObject {
             exportState = .error(error.localizedDescription)
             Logger.noteExport.error("Export failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Export one note as a self-contained PDF into a user-selected folder.
+    /// This is an opt-in app path; the existing tree, archive, sync, CLI and
+    /// MCP routes continue to use `exportNotes` unchanged.
+    func exportSingleNotePDF(
+        _ note: NotesNote,
+        toDirectory destinationDirectory: URL
+    ) async {
+        shouldCancel = false
+        exportLog = []
+        failedNotesCount = 0
+        failedAttachmentsCount = 0
+        flatPDFIncompleteAttachmentIDs = []
+        internalLinkMap = [:]
+        lastExportArtifactURL = nil
+        exportState = .exporting(ExportProgress(current: 0, total: 1, message: "Preparing PDF..."))
+
+        var stagingDirectory: URL?
+        defer {
+            if let stagingDirectory {
+                do {
+                    try Self.removeFlatPDFStagingDirectory(at: stagingDirectory)
+                } catch {
+                    log("⚠︎ Could not remove this export's temporary PDF files: \(error.localizedDescription)")
+                }
+            }
+            internalLinkMap = [:]
+        }
+
+        do {
+            try Task.checkCancellation()
+
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: destinationDirectory.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw ExportError.invalidPDFDestinationDirectory(destinationDirectory.lastPathComponent)
+            }
+
+            let staging = try Self.createFlatPDFStagingDirectory()
+            stagingDirectory = staging
+            log("Staging this single-note PDF in a private temporary directory")
+
+            var attachmentPaths: [String: String] = [:]
+            let inlineImageAttachments = note.attachments.filter {
+                HTMLAttachmentProcessor.isInlineImageType($0.typeUTI)
+            }
+            if !inlineImageAttachments.isEmpty {
+                // Stage only image sources that may be needed to render inline.
+                // Other files are not delivered by this single-PDF mode and must
+                // not be logged as exported before their staging copy is deleted.
+                let attachmentResult = try await exportNoteAttachments(
+                    inlineImageAttachments,
+                    toDirectory: staging,
+                    outputRoot: staging,
+                    noteBaseName: Self.safeFlatPDFBaseName(note.title),
+                    noteTitle: note.title,
+                    creationDate: note.creationDate,
+                    modificationDate: note.modificationDate,
+                    sharedAttachmentsFolder: false,
+                    repository: repository
+                )
+                attachmentPaths = attachmentResult.paths
+                for event in attachmentResult.events {
+                    let message = event.message
+                        .replacingOccurrences(of: "Exported attachment:", with: "Prepared temporary inline image source:")
+                        .replacingOccurrences(of: "Failed to export attachment -", with: "Could not prepare a temporary inline image source -")
+                    log(message)
+                }
+            }
+
+            try Task.checkCancellation()
+            if shouldCancel { throw CancellationError() }
+
+            let pdfConfig = configurations.pdf
+            let pageSize = pdfConfig.pageSize.dimensions
+            let pdfHTMLConfig = pdfConfig.htmlConfiguration
+            var standaloneHTMLConfig = pdfHTMLConfig
+            // A final PDF must not rely on images in the temporary staging
+            // folder or on user preferences that disable inline images.
+            standaloneHTMLConfig.embedImagesInline = true
+            standaloneHTMLConfig.linkEmbeddedImages = false
+
+            let html = try await generateHTML(
+                for: note,
+                config: standaloneHTMLConfig,
+                forPDF: true,
+                attachmentPaths: attachmentPaths,
+                exportDirectory: staging,
+                pdfPageSize: CGSize(width: pageSize.width, height: pageSize.height),
+                pdfMargins: standaloneHTMLConfig.toNSEdgeInsets(),
+                standalonePDF: true
+            )
+
+            let stagedPDF = staging.appendingPathComponent("rendered.pdf")
+            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
+                margins: standaloneHTMLConfig.toPDFEdgeInsets(),
+                paperSize: CGSize(width: pageSize.width, height: pageSize.height)
+            )
+            log("Rendering standalone PDF...")
+            try await renderFlatPDF(html, to: stagedPDF, configuration: pdfConfiguration)
+
+            try Task.checkCancellation()
+            if shouldCancel { throw CancellationError() }
+
+            try setExportFileTimestamps(
+                stagedPDF,
+                creationDate: note.creationDate,
+                modificationDate: note.modificationDate
+            )
+
+            let finalURL = try Self.moveFlatPDFWithoutOverwriting(
+                stagedPDF,
+                noteTitle: note.title,
+                toDirectory: destinationDirectory
+            )
+            // The defer removes staged image sources on every exit path, after
+            // the final PDF has been moved out of the private staging folder.
+            // Record delivery first so cleanup errors do not falsely imply the
+            // final PDF itself was not written.
+            lastExportArtifactURL = finalURL
+            failedAttachmentsCount = flatPDFIncompleteAttachmentIDs.count
+
+            if failedAttachmentsCount > 0 {
+                log("⚠︎ PDF created with \(failedAttachmentsCount) attachment(s) not fully preserved; see attachment warnings above.")
+            }
+            log("✓ Wrote standalone PDF: \(finalURL.lastPathComponent)")
+            exportState = .completed(ExportStatistics(
+                successfulNotes: 1,
+                failedNotes: 0,
+                failedAttachments: failedAttachmentsCount,
+                completionDate: Date()
+            ))
+        } catch is CancellationError {
+            exportState = .cancelled
+            log("Export cancelled; temporary PDF files will be removed")
+        } catch {
+            failedNotesCount = 1
+            exportState = .error(error.localizedDescription)
+            log("✗ Failed to export standalone PDF for '\(note.title)': \(error.localizedDescription)")
+            Logger.noteExport.error("Standalone PDF export failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func renderFlatPDF(
+        _ html: String,
+        to url: URL,
+        configuration: HtmlToPdf.PDFConfiguration
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await html.print(to: url, configuration: configuration)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+                throw ExportError.pdfGenerationTimeout
+            }
+            group.addTask {
+                while true {
+                    try Task.checkCancellation()
+                    if await MainActor.run(body: { self.shouldCancel }) {
+                        throw CancellationError()
+                    }
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
+
+            try await group.next()
+            group.cancelAll()
+        }
+    }
+
+    static func moveFlatPDFWithoutOverwriting(
+        _ stagedPDF: URL,
+        noteTitle: String,
+        toDirectory destinationDirectory: URL
+    ) throws -> URL {
+        let baseName = safeFlatPDFBaseName(noteTitle)
+
+        for collisionNumber in 1...10_000 {
+            let filename = collisionNumber == 1
+                ? "\(baseName).pdf"
+                : "\(baseName) (\(collisionNumber)).pdf"
+            let destination = destinationDirectory.appendingPathComponent(filename)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+
+            do {
+                // FileManager's move fails when the destination already
+                // exists; it never silently replaces an existing PDF.
+                try FileManager.default.moveItem(at: stagedPDF, to: destination)
+                return destination
+            } catch {
+                // A competing export may have claimed the same name after
+                // the preflight check. Retry only if that exact path now
+                // exists; propagate unrelated I/O and permission failures.
+                if FileManager.default.fileExists(atPath: destination.path) { continue }
+                throw error
+            }
+        }
+
+        throw ExportError.tooManyPDFNameCollisions
+    }
+
+    private static func safeFlatPDFBaseName(_ title: String) -> String {
+        let sanitized = sanitizeExportFilename(title).trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? "Untitled Note" : sanitized
     }
 
     /// Export notes concurrently using TaskGroup
@@ -984,7 +1236,8 @@ class ExportViewModel: ObservableObject {
         exportDirectory: URL? = nil,
         targetFormat: ExportFormat? = nil,
         pdfPageSize: CGSize? = nil,
-        pdfMargins: NSEdgeInsets? = nil
+        pdfMargins: NSEdgeInsets? = nil,
+        standalonePDF: Bool = false
     ) async throws -> String {
         let dateFormatter = DateFormatter()
         dateFormatter.dateStyle = .medium
@@ -1008,6 +1261,9 @@ class ExportViewModel: ObservableObject {
             } catch {
                 // Fallback to plaintext if HTML generation fails (corrupted protobuf, etc.)
                 Logger.noteExport.warning("Failed to generate HTML for note \(note.id), falling back to plaintext: \(error)")
+                if standalonePDF {
+                    log("⚠︎ Rich note content could not be generated; the PDF uses a plain-text fallback.")
+                }
                 htmlBody = plaintextFallbackHTMLDocument(plaintext: note.plaintext)
             }
         }
@@ -1026,9 +1282,11 @@ class ExportViewModel: ObservableObject {
         // since we wrap the content in our own full HTML document below.
         var processedHTML = linkRewrittenBody
 
-        // Only process attachments if we have a database connection and attachments to process
+        // Only process attachments if we have a database connection and attachments to process.
+        // A standalone PDF additionally records any attachment that cannot be
+        // represented by bytes inside the PDF; temporary sibling links are not
+        // a valid fallback for a single-file deliverable.
         if !note.attachments.isEmpty {
-            // Open a C parser handle and extract the sqlite3 pointer for HTMLAttachmentProcessor
             if let parserHandle = ane_open(databasePath) {
                 defer { ane_close(parserHandle) }
                 if let rawHandle = ane_get_sqlite_handle(parserHandle) {
@@ -1040,9 +1298,29 @@ class ExportViewModel: ObservableObject {
                         attachmentPaths: attachmentPaths,
                         exportDirectory: exportDirectory?.path,
                         embedImages: htmlConfig.embedImagesInline,
-                        linkEmbeddedImages: htmlConfig.linkEmbeddedImages
+                        linkEmbeddedImages: htmlConfig.linkEmbeddedImages,
+                        standalonePDF: standalonePDF
+                    )
+                    if standalonePDF {
+                        flatPDFIncompleteAttachmentIDs.formUnion(processor.incompleteAttachmentIDs)
+                        for diagnostic in processor.diagnostics {
+                            log("⚠︎ \(diagnostic)")
+                        }
+                        for notice in processor.notices {
+                            log("ℹ︎ \(notice)")
+                        }
+                    }
+                } else if standalonePDF {
+                    recordFlatPDFAttachmentFailure(
+                        note.attachments,
+                        reason: "The Notes database attachment handle was unavailable"
                     )
                 }
+            } else if standalonePDF {
+                recordFlatPDFAttachmentFailure(
+                    note.attachments,
+                    reason: "The Notes database could not be opened to verify attachment data"
+                )
             }
         }
 
@@ -1071,6 +1349,14 @@ class ExportViewModel: ObservableObject {
                 forPDF: forPDF, pageSize: pdfPageSize, margins: pdfMargins),
             body: processedHTML
         )
+    }
+
+    private func recordFlatPDFAttachmentFailure(_ attachments: [NotesAttachment], reason: String) {
+        flatPDFIncompleteAttachmentIDs.formUnion(attachments.map(\.id))
+        for attachment in attachments {
+            let label = attachment.filename ?? attachment.id
+            log("⚠︎ Attachment '\(label)' was not verified for the PDF: \(reason).")
+        }
     }
 
     // MARK: - Helper Methods
