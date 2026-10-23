@@ -1,10 +1,10 @@
 # P2 — Apple Notes Exporter Integration & End-to-End Validation
 
-**Decision: READY WITH LIMITATIONS**  
-**Date:** 2026-10-23  
-**Integration branch:** `codex/notes-pdf-integration`  
-**Integration pre-wiring HEAD:** `d618d785b5a9d45e0dc1eb85f1af20913a6fab88`  
-**Baseline:** `main` at `e05a858168e9a33d08e3748f0a37547a60f50fa2`  
+**Decision: READY WITH LIMITATIONS**
+**Date:** 2026-10-23
+**Integration branch:** `codex/notes-pdf-integration`
+**Integration pre-wiring HEAD:** `d618d785b5a9d45e0dc1eb85f1af20913a6fab88`
+**Baseline:** `main` at `e05a858168e9a33d08e3748f0a37547a60f50fa2`
 **Final branch commit:** the commit containing this report and its accompanying integration documentation; the final exact HEAD is recorded in the completion handoff.
 
 This is a local integration checkpoint only. No push, merge into `main`, release, or distribution was performed.
