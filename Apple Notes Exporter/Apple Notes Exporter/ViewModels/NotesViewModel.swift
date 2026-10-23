@@ -56,6 +56,10 @@ class NotesViewModel: ObservableObject {
         selectionState.selectedNotes(from: allNotes)
     }
 
+    var selectedNoteIDs: Set<String> {
+        selectionState.selectedNoteIDs
+    }
+
     // MARK: - Dependencies
 
     private let repository: NotesRepository
@@ -116,12 +120,12 @@ class NotesViewModel: ObservableObject {
 
             loadingState = .loaded
 
-            // Automatically select all notes after loading
-            selectAll()
+            // Start with an explicit empty selection so opening the app never
+            // silently queues the entire Notes library for export.
+            clearSelections()
 
             Logger.noteQuery.info("Raw fetch: \(accounts.count) accounts, \(folders.count) folders, \(notes.count) notes")
             Logger.noteQuery.info("Loaded \(self.allNotes.count) notes from \(self.accountsCount) accounts (tree)")
-            Logger.noteQuery.info("Automatically selected all \(self.selectedCount) notes")
 
         } catch let error as RepositoryError {
             loadingState = .error(error.localizedDescription)
@@ -170,13 +174,69 @@ class NotesViewModel: ObservableObject {
         selectionState.deselectFolder(folderNode)
     }
 
-    /// Toggle folder selection
+    /// Toggle folder selection. A partial folder becomes fully selected; a
+    /// fully-selected folder becomes empty.
     func toggleFolder(_ folderNode: NotesHierarchy.FolderNode) {
-        if selectionState.isFolderSelected(folderNode.folder.id, in: hierarchy) {
-            deselectFolder(folderNode)
-        } else {
-            selectFolder(folderNode)
+        setNotes(
+            noteIDs(in: folderNode),
+            selected: selectionStatus(for: folderNode) != .all
+        )
+    }
+
+    func toggleNotes(_ noteIDs: [String]) {
+        setNotes(noteIDs, selected: selectionState.selectionStatus(for: noteIDs) != .all)
+    }
+
+    func setNotes(_ noteIDs: [String], selected: Bool) {
+        selectionState.setNotes(noteIDs, selected: selected)
+    }
+
+    func updateVisibleSelection(_ selectedIDs: Set<String>, visibleIDs: Set<String>) {
+        selectionState.updateVisibleSelection(selectedIDs, visibleIDs: visibleIDs)
+    }
+
+    func selectionStatus(for noteIDs: [String]) -> NoteSelectionStatus {
+        selectionState.selectionStatus(for: noteIDs)
+    }
+
+    func selectionStatus(for folderNode: NotesHierarchy.FolderNode) -> NoteSelectionStatus {
+        selectionState.selectionStatus(for: noteIDs(in: folderNode))
+    }
+
+    func notes(in scope: NoteBrowserScope) -> [NotesNote] {
+        switch scope {
+        case .allNotes:
+            return allNotes
+        case .account(let accountId):
+            guard let account = hierarchy.accounts.first(where: { $0.account.id == accountId }) else { return [] }
+            return account.folders.flatMap { collectNotes(from: $0) }
+        case .folder(let folderId):
+            guard let folder = folderNode(withId: folderId) else { return [] }
+            return collectNotes(from: folder)
         }
+    }
+
+    func scopeTitle(for scope: NoteBrowserScope) -> String {
+        switch scope {
+        case .allNotes:
+            return "All Notes"
+        case .account(let accountId):
+            return hierarchy.accounts.first(where: { $0.account.id == accountId })?.account.name ?? "Account"
+        case .folder(let folderId):
+            return folderNode(withId: folderId)?.folder.name ?? "Folder"
+        }
+    }
+
+    func locationDescription(for note: NotesNote) -> String {
+        let accountName = rawAccounts.first(where: { $0.id == note.accountId })?.name ?? "Unknown Account"
+        let folderName = rawFolders.first(where: { $0.id == note.folderId })?.name ?? "Notes"
+        return "\(accountName) · \(folderName)"
+    }
+
+    static func filterNotes(_ notes: [NotesNote], matchingTitle query: String) -> [NotesNote] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return notes }
+        return notes.filter { $0.title.localizedStandardContains(query) }
     }
 
     /// Clear all selections
@@ -204,12 +264,37 @@ class NotesViewModel: ObservableObject {
         return notes
     }
 
+    private func noteIDs(in folder: NotesHierarchy.FolderNode) -> [String] {
+        folder.notes.map(\.id) + folder.subfolders.flatMap { noteIDs(in: $0) }
+    }
+
+    private func folderNode(withId folderId: String) -> NotesHierarchy.FolderNode? {
+        for account in hierarchy.accounts {
+            for folder in account.folders {
+                if let match = findFolder(folderId, in: folder) { return match }
+            }
+        }
+        return nil
+    }
+
+    private func findFolder(
+        _ folderId: String,
+        in folder: NotesHierarchy.FolderNode
+    ) -> NotesHierarchy.FolderNode? {
+        if folder.folder.id == folderId { return folder }
+        for child in folder.subfolders {
+            if let match = findFolder(folderId, in: child) { return match }
+        }
+        return nil
+    }
+
     /// Check if a note is selected
     func isNoteSelected(_ noteId: String) -> Bool {
         selectionState.isNoteSelected(noteId)
     }
 
-    /// Check if a folder is selected
+    /// Check if a folder is fully selected. Partial state is available through
+    /// `selectionStatus(for:)` for UI rendering.
     func isFolderSelected(_ folderId: String) -> Bool {
         selectionState.isFolderSelected(folderId, in: hierarchy)
     }
