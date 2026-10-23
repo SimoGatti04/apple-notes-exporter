@@ -19,6 +19,9 @@
 //
 
 import XCTest
+import AppKit
+import PDFKit
+import SQLite3
 @testable import Apple_Notes_Exporter
 
 /// Exports the same notes through the app's engine and the CLI's engine and
@@ -88,6 +91,79 @@ final class EngineParityTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         return dir
+    }
+
+    private func makeNote(
+        title: String = "Flat Note",
+        htmlBody: String = "<html><body><p>Standalone PDF body</p></body></html>",
+        attachments: [NotesAttachment] = []
+    ) -> NotesNote {
+        NotesNote(
+            id: "synthetic-note", title: title, plaintext: "Standalone PDF body", htmlBody: htmlBody,
+            creationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_100),
+            folderId: "1", accountId: "1", attachments: attachments
+        )
+    }
+
+    private func executeSQL(_ sql: String, databasePath: String) throws {
+        var db: OpaquePointer?
+        guard sqlite3_open(databasePath, &db) == SQLITE_OK, let db else {
+            throw NSError(domain: "EngineParityTests.SQLite", code: 1)
+        }
+        defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw NSError(domain: "EngineParityTests.SQLite", code: 2)
+        }
+    }
+
+    private func openAttachmentTestDatabase() throws -> OpaquePointer {
+        var db: OpaquePointer?
+        guard sqlite3_open(":memory:", &db) == SQLITE_OK, let db else {
+            throw NSError(domain: "EngineParityTests.SQLite", code: 3)
+        }
+        let schema = """
+        CREATE TABLE ZICCLOUDSYNCINGOBJECT (
+            ZIDENTIFIER TEXT PRIMARY KEY, ZMEDIA BLOB, ZURLSTRING TEXT, ZTITLE TEXT,
+            ZALTTEXT TEXT, ZMARKEDFORDELETION INTEGER
+        );
+        INSERT INTO ZICCLOUDSYNCINGOBJECT (ZIDENTIFIER, ZURLSTRING, ZTITLE, ZMARKEDFORDELETION)
+            VALUES ('web-link', 'https://example.test/guide', 'External guide', 0);
+        """
+        guard sqlite3_exec(db, schema, nil, nil, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            throw NSError(domain: "EngineParityTests.SQLite", code: 4)
+        }
+        return db
+    }
+
+    private func flatPDFStagingPaths() -> Set<String> {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+        let children = (try? FileManager.default.contentsOfDirectory(
+            at: temporaryRoot, includingPropertiesForKeys: nil
+        )) ?? []
+        return Set(children.filter { $0.lastPathComponent.hasPrefix("apple-notes-exporter-pdf-") }.map(\.path))
+    }
+
+    private func makeSolidPNG() throws -> Data {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 48, pixelsHigh: 48,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            throw NSError(domain: "EngineParityTests.Image", code: 1)
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.imageInterpolation = .none
+        NSColor.red.setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 48, height: 48)).fill()
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw NSError(domain: "EngineParityTests.Image", code: 2)
+        }
+        return png
     }
 
     // MARK: - Comparison
@@ -163,6 +239,308 @@ final class EngineParityTests: XCTestCase {
     }
 
     // MARK: - Tests
+
+    func test_singleNotePDFWritesFlatAndRemovesStagingDirectory() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let stagingBefore = flatPDFStagingPaths()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+
+        await viewModel.exportSingleNotePDF(makeNote(), toDirectory: output)
+
+        guard case .completed(let statistics) = viewModel.exportState else {
+            return XCTFail("Expected completed export, got \(viewModel.exportState)")
+        }
+        XCTAssertEqual(statistics.successfulNotes, 1)
+        XCTAssertEqual(statistics.failedAttachments, 0)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.path), ["Flat Note.pdf"])
+        XCTAssertEqual(viewModel.lastExportArtifactURL?.lastPathComponent, "Flat Note.pdf")
+        XCTAssertEqual(flatPDFStagingPaths(), stagingBefore)
+        XCTAssertNotNil(PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")))
+    }
+
+    func test_standalonePDFPaginatesAtConfiguredSizeAndKeepsTextSelectable() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        var configurations = ExportConfigurations.default
+        configurations.pdf.pageSize = .a5
+        configurations.pdf.htmlConfiguration.marginSize = 24
+        configurations.pdf.htmlConfiguration.marginUnit = .pt
+        viewModel.configurations = configurations
+
+        let body = (1...100).map { index in
+            "<p>Selectable pagination paragraph \(index) with enough words to occupy printable width.</p>"
+        }.joined()
+        let finalMarker = "Selectable page marker 100"
+        let note = makeNote(
+            htmlBody: "<html><body>\(body)<p>\(finalMarker)</p></body></html>"
+        )
+
+        await viewModel.exportSingleNotePDF(note, toDirectory: output)
+
+        guard case .completed = viewModel.exportState,
+              let pdf = PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")),
+              let firstPage = pdf.page(at: 0) else {
+            return XCTFail("Expected a valid multi-page standalone PDF")
+        }
+        XCTAssertGreaterThan(pdf.pageCount, 1, "The whole document should paginate, not clip at the viewport")
+        let pageBounds = firstPage.bounds(for: .mediaBox)
+        XCTAssertEqual(pageBounds.width, 420, accuracy: 2)
+        XCTAssertEqual(pageBounds.height, 595, accuracy: 2)
+        let firstParagraphSelection = try XCTUnwrap(
+            pdf.findString("Selectable pagination paragraph 1", withOptions: []).first
+        )
+        let firstParagraphBounds = firstParagraphSelection.bounds(for: firstPage)
+        XCTAssertGreaterThanOrEqual(firstParagraphBounds.minX, 20, "Configured left margin should be honored")
+        XCTAssertGreaterThan(pageBounds.maxY - firstParagraphBounds.maxY, 20,
+                             "Configured top margin should be honored")
+        let selectableText = (0..<pdf.pageCount)
+            .compactMap { pdf.page(at: $0)?.string }
+            .joined(separator: " ")
+        XCTAssertTrue(selectableText.contains("Selectable pagination paragraph 1"))
+        XCTAssertTrue(selectableText.contains(finalMarker))
+    }
+
+    func test_standalonePDFCollisionMovePreservesExistingFile() throws {
+        let output = try makeOutputDirectory()
+        let staging = output.deletingLastPathComponent()
+            .appendingPathComponent("ane-pdf-stage-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        addTeardownBlock { try? FileManager.default.removeItem(at: staging) }
+
+        let existingPDF = output.appendingPathComponent("Flat Note.pdf")
+        let sentinel = Data("existing user file".utf8)
+        try sentinel.write(to: existingPDF)
+        let stagedPDF = staging.appendingPathComponent("rendered.pdf")
+        let generatedBytes = Data("generated PDF bytes".utf8)
+        try generatedBytes.write(to: stagedPDF)
+
+        let deliveredURL = try ExportViewModel.moveFlatPDFWithoutOverwriting(
+            stagedPDF,
+            noteTitle: "Flat Note",
+            toDirectory: output
+        )
+
+        XCTAssertEqual(deliveredURL.lastPathComponent, "Flat Note (2).pdf")
+        XCTAssertEqual(try Data(contentsOf: existingPDF), sentinel)
+        XCTAssertEqual(try Data(contentsOf: deliveredURL), generatedBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagedPDF.path))
+    }
+
+    func test_singleNotePDFNeverOverwritesAndUsesStableCollisionSuffixes() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let original = output.appendingPathComponent("Flat Note.pdf")
+        let sentinel = Data("pre-existing user data".utf8)
+        try sentinel.write(to: original)
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+
+        await viewModel.exportSingleNotePDF(makeNote(), toDirectory: output)
+        XCTAssertEqual(try Data(contentsOf: original), sentinel)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent("Flat Note (2).pdf").path))
+
+        await viewModel.exportSingleNotePDF(makeNote(), toDirectory: output)
+        XCTAssertEqual(try Data(contentsOf: original), sentinel)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent("Flat Note (3).pdf").path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.path).count, 3)
+    }
+
+    func test_standalonePDFShowsOriginalInlineImageInRenderedPDF() async throws {
+        let dbPath = try makeFixtureDatabase()
+        let png = try makeSolidPNG()
+        let pngHex = png.map { String(format: "%02x", $0) }.joined()
+        try executeSQL("""
+            CREATE TABLE ZICCLOUDSYNCINGOBJECT (
+                ZIDENTIFIER TEXT PRIMARY KEY, ZMEDIA BLOB, ZURLSTRING TEXT, ZTITLE TEXT,
+                ZALTTEXT TEXT, ZMARKEDFORDELETION INTEGER
+            );
+            INSERT INTO ZICCLOUDSYNCINGOBJECT (ZIDENTIFIER, ZMEDIA, ZMARKEDFORDELETION)
+                VALUES ('image-1', x'\(pngHex)', 0);
+            """, databasePath: dbPath)
+        let output = try makeOutputDirectory()
+        let attachment = NotesAttachment(id: "image-1", typeUTI: "public.png", filename: "red-square.png")
+        let html = "<html><body><p>Image marker</p><span data-attachment-id=\"image-1\" data-attachment-type=\"public.png\">[image]</span></body></html>"
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: dbPath), databasePath: dbPath
+        )
+
+        await viewModel.exportSingleNotePDF(
+            makeNote(htmlBody: html, attachments: [attachment]),
+            toDirectory: output
+        )
+
+        guard case .completed(let statistics) = viewModel.exportState, statistics.failedAttachments == 0,
+              let pdf = PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")),
+              let page = pdf.page(at: 0) else {
+            return XCTFail("Expected a complete PDF with its inline image")
+        }
+        let thumbnail = page.thumbnail(of: CGSize(width: 600, height: 800), for: .mediaBox)
+        guard let tiff = thumbnail.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff) else {
+            return XCTFail("Could not inspect the rendered PDF page")
+        }
+        var foundRedPixel = false
+        for y in 0..<bitmap.pixelsHigh where !foundRedPixel {
+            for x in 0..<bitmap.pixelsWide {
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                if color.redComponent > 0.8 && color.greenComponent < 0.35 && color.blueComponent < 0.35 {
+                    foundRedPixel = true
+                    break
+                }
+            }
+        }
+        XCTAssertTrue(foundRedPixel, "The image data URI must be visibly rasterized into the final PDF")
+        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("Wrote standalone PDF") })
+    }
+
+    func test_standaloneProcessorLabelsFileReferencesAndExternalLinksHonestly() throws {
+        XCTAssertTrue(HTMLAttachmentProcessor.isInlineImageType("com.apple.notes.gallery"),
+                      "Legacy exports keep their existing gallery-as-image classification.")
+        let db = try openAttachmentTestDatabase()
+        defer { sqlite3_close(db) }
+        let processor = HTMLAttachmentProcessor(database: db)
+        let attachments = [
+            NotesAttachment(id: "pdf-1", typeUTI: "public.pdf", filename: "manual.pdf"),
+            NotesAttachment(id: "word-1", typeUTI: "org.openxmlformats.wordprocessingml.document", filename: "letter.docx"),
+            NotesAttachment(id: "markdown-1", typeUTI: "net.daringfireball.markdown", filename: "readme.md"),
+            NotesAttachment(id: "generic-1", typeUTI: "com.example.binary", filename: "data.bin"),
+            NotesAttachment(id: "gallery-1", typeUTI: "com.apple.notes.gallery", filename: "Photos"),
+            NotesAttachment(id: "web-link", typeUTI: "public.url", filename: "External guide"),
+            NotesAttachment(id: "missing-link", typeUTI: "public.url", filename: "Missing link")
+        ]
+        let html = attachments.map { attachment in
+            "<span data-attachment-id=\"\(attachment.id)\" data-attachment-type=\"\(attachment.typeUTI)\">[attachment]</span>"
+        }.joined()
+        var stagingPaths: [String: String] = [:]
+        for attachment in attachments {
+            stagingPaths[attachment.id] = "Attachments/\(attachment.filename ?? attachment.id)"
+        }
+
+        let result = processor.processHTML(
+            html: html, attachments: attachments, attachmentPaths: stagingPaths,
+            exportDirectory: "/private/tmp/controlled-staging", embedImages: true,
+            linkEmbeddedImages: false, standalonePDF: true
+        )
+
+        XCTAssertEqual(result.components(separatedBy: "href=").count - 1, 1,
+                       "Only the intentional external web link may remain clickable")
+        XCTAssertTrue(result.contains("href=\"https://example.test/guide\""))
+        XCTAssertFalse(result.contains("controlled-staging"))
+        XCTAssertFalse(result.contains("Attachments/"))
+        for filename in ["manual.pdf", "letter.docx", "readme.md", "data.bin"] {
+            XCTAssertTrue(result.contains(filename))
+            XCTAssertTrue(result.localizedCaseInsensitiveContains("not embedded"))
+        }
+        XCTAssertTrue(result.contains("Word Document"))
+        XCTAssertTrue(result.contains("Markdown Document"))
+        XCTAssertTrue(result.contains("Original gallery images not fully rendered or embedded"))
+        XCTAssertTrue(result.contains("Photos"))
+        XCTAssertTrue(result.contains("https://example.test/guide"))
+        XCTAssertTrue(processor.notices.contains { $0.contains("not downloaded or embedded") })
+        XCTAssertEqual(processor.incompleteAttachmentIDs, Set(["pdf-1", "word-1", "markdown-1", "generic-1", "gallery-1", "missing-link"]))
+        XCTAssertEqual(processor.diagnostics.count, 6)
+    }
+
+    func test_standaloneProcessorReportsUnavailableImageWithoutStagingLink() throws {
+        let db = try openAttachmentTestDatabase()
+        defer { sqlite3_close(db) }
+        let processor = HTMLAttachmentProcessor(database: db)
+        let attachment = NotesAttachment(id: "missing-image", typeUTI: "public.png", filename: "gone.png")
+        let html = "<span data-attachment-id=\"missing-image\" data-attachment-type=\"public.png\">[image]</span>"
+
+        let result = processor.processHTML(
+            html: html,
+            attachments: [attachment],
+            attachmentPaths: ["missing-image": "Attachments/gone.png"],
+            exportDirectory: "/private/tmp/controlled-staging",
+            embedImages: true,
+            linkEmbeddedImages: false,
+            standalonePDF: true
+        )
+
+        XCTAssertTrue(result.contains("Image unavailable: gone.png"))
+        XCTAssertFalse(result.contains("controlled-staging"))
+        XCTAssertFalse(result.contains("Attachments/gone.png"))
+        XCTAssertEqual(processor.incompleteAttachmentIDs, ["missing-image"])
+        XCTAssertEqual(processor.diagnostics.count, 1)
+    }
+
+    func test_unavailableInlineImageIsReportedAsPartialAndNeverLinksToStaging() async throws {
+        let dbPath = try makeFixtureDatabase()
+        try executeSQL("CREATE TABLE ZICCLOUDSYNCINGOBJECT (ZIDENTIFIER TEXT PRIMARY KEY, ZMEDIA BLOB, ZMARKEDFORDELETION INTEGER);", databasePath: dbPath)
+        let output = try makeOutputDirectory()
+        let attachment = NotesAttachment(id: "missing-image", typeUTI: "public.png", filename: "gone.png")
+        let html = "<html><body><span data-attachment-id=\"missing-image\" data-attachment-type=\"public.png\">[image]</span></body></html>"
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: dbPath), databasePath: dbPath
+        )
+
+        await viewModel.exportSingleNotePDF(
+            makeNote(htmlBody: html, attachments: [attachment]),
+            toDirectory: output
+        )
+
+        guard case .completed(let statistics) = viewModel.exportState else {
+            return XCTFail("An unavailable attachment should still produce a partial PDF")
+        }
+        XCTAssertEqual(statistics.failedAttachments, 1)
+        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("Image unavailable") || $0.contains("incomplete in the standalone PDF") })
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.path), ["Flat Note.pdf"])
+    }
+
+    func test_cancelledStandaloneConversionRemovesStagingAndDoesNotDeliverPartialPDF() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let stagingBefore = flatPDFStagingPaths()
+        let longBody = String(repeating: "<p>Cancellation checkpoint with enough text to paginate.</p>", count: 1_500)
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        let exportTask = Task {
+            await viewModel.exportSingleNotePDF(
+                makeNote(htmlBody: "<html><body>\(longBody)</body></html>"),
+                toDirectory: output
+            )
+        }
+
+        for _ in 0..<500 {
+            if viewModel.exportLog.contains(where: { $0.contains("Printing standalone PDF pages") }) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("Printing standalone PDF pages") })
+        viewModel.shouldCancel = true
+        exportTask.cancel()
+        await exportTask.value
+
+        XCTAssertEqual(viewModel.exportState, .cancelled)
+        XCTAssertTrue((try? FileManager.default.contentsOfDirectory(atPath: output.path))?.isEmpty == true)
+        XCTAssertEqual(flatPDFStagingPaths(), stagingBefore)
+    }
+
+    func test_legacyPDFExportStillCreatesItsExistingAccountAndFolderTree() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+
+        await viewModel.exportNotes([makeNote()], toDirectory: output, format: .pdf)
+
+        guard case .completed = viewModel.exportState else {
+            return XCTFail("Expected the legacy PDF export path to complete")
+        }
+        let pdfs = (FileManager.default.enumerator(at: output, includingPropertiesForKeys: [.isRegularFileKey]))?
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension.lowercased() == "pdf" } ?? []
+        XCTAssertEqual(pdfs.count, 1)
+        XCTAssertGreaterThan(pdfs[0].pathComponents.count, output.pathComponents.count + 1)
+    }
 
     func test_appAndCLIProduceTheSameFilesForEveryTextFormat() async throws {
         let db = try makeFixtureDatabase()

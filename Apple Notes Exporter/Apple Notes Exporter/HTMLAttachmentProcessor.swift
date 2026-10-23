@@ -29,9 +29,30 @@ class HTMLAttachmentProcessor {
     private let tableParser: TableParser
     private var exportDirectory: String?
 
+    /// Attachments whose content could not be represented inside a standalone PDF.
+    private(set) var incompleteAttachmentIDs: Set<String> = []
+    /// User-visible export warnings, suitable for the export log.
+    private(set) var diagnostics: [String] = []
+    /// Informational notes that clarify external references without counting
+    /// them as failed attachment preservation.
+    private(set) var notices: [String] = []
+
     init(database: OpaquePointer) {
         self.db = database
         self.tableParser = TableParser(database: database)
+    }
+
+    static func isInlineImageType(_ typeUTI: String) -> Bool {
+        typeUTI.hasPrefix("public.image") ||
+        typeUTI.hasPrefix("public.jpeg") ||
+        typeUTI.hasPrefix("public.png") ||
+        typeUTI.hasPrefix("public.heic") ||
+        typeUTI.hasPrefix("public.tiff") ||
+        typeUTI.hasPrefix("com.compuserve.gif") ||
+        typeUTI == "com.apple.paper" ||
+        typeUTI == "com.apple.drawing" ||
+        typeUTI == "com.apple.drawing.2" ||
+        typeUTI == "com.apple.notes.gallery"
     }
 
     /// Process HTML to replace attachment markers with actual content
@@ -49,7 +70,8 @@ class HTMLAttachmentProcessor {
         attachmentPaths: [String: String],
         exportDirectory: String? = nil,
         embedImages: Bool,
-        linkEmbeddedImages: Bool
+        linkEmbeddedImages: Bool,
+        standalonePDF: Bool = false
     ) -> String {
         // Store export directory for later use
         self.exportDirectory = exportDirectory
@@ -73,8 +95,16 @@ class HTMLAttachmentProcessor {
             attachmentMap: attachmentMap,
             attachmentPaths: attachmentPaths,
             embedImages: embedImages,
-            linkEmbeddedImages: linkEmbeddedImages
+            linkEmbeddedImages: linkEmbeddedImages,
+            standalonePDF: standalonePDF
         )
+
+        if standalonePDF {
+            let represented = representedAttachmentIDs(in: html)
+            for attachment in attachments where !represented.contains(attachment.id) {
+                markIncomplete(attachment, reason: "it has no inline marker in the note HTML")
+            }
+        }
 
         return processedHTML
     }
@@ -85,7 +115,8 @@ class HTMLAttachmentProcessor {
         attachmentMap: [String: NotesAttachment],
         attachmentPaths: [String: String],
         embedImages: Bool,
-        linkEmbeddedImages: Bool
+        linkEmbeddedImages: Bool,
+        standalonePDF: Bool
     ) -> String {
         var result = html
 
@@ -123,7 +154,8 @@ class HTMLAttachmentProcessor {
                 uuid: uuid,
                 relativePath: attachmentPaths[uuid],
                 embedImages: embedImages,
-                linkEmbeddedImages: linkEmbeddedImages
+                linkEmbeddedImages: linkEmbeddedImages,
+                standalonePDF: standalonePDF
             )
 
             result = (result as NSString).replacingCharacters(in: fullRange, with: replacement)
@@ -138,43 +170,66 @@ class HTMLAttachmentProcessor {
         uuid: String,
         relativePath: String?,
         embedImages: Bool,
-        linkEmbeddedImages: Bool
+        linkEmbeddedImages: Bool,
+        standalonePDF: Bool
     ) -> String {
+        // A Notes gallery is a collection, not one raster image. The current
+        // single-PDF path cannot render every child image in its original order,
+        // so show an explicit incomplete reference rather than silently using
+        // only the first staged child as if it represented the whole gallery.
+        if standalonePDF && attachment.typeUTI == "com.apple.notes.gallery" {
+            markIncomplete(attachment, reason: "the gallery’s original images are not all rendered in the standalone PDF")
+            return generateStandaloneFileReferenceHTML(
+                filename: attachment.filename ?? "Image gallery",
+                description: "Original gallery images not fully rendered or embedded"
+            )
+        }
+
         // Check if this is an image
         // Also treat drawings/sketches as images since they have fallback image data
-        if attachment.typeUTI.hasPrefix("public.image") ||
-           attachment.typeUTI.hasPrefix("public.jpeg") ||
-           attachment.typeUTI.hasPrefix("public.png") ||
-           attachment.typeUTI.hasPrefix("public.heic") ||
-           attachment.typeUTI.hasPrefix("public.tiff") ||
-           attachment.typeUTI.hasPrefix("com.compuserve.gif") ||
-           attachment.typeUTI == "com.compuserve.gif" ||
-           attachment.typeUTI == "com.apple.paper" ||
-           attachment.typeUTI == "com.apple.drawing" ||
-           attachment.typeUTI == "com.apple.drawing.2" ||
-           attachment.typeUTI == "com.apple.notes.gallery" {
+        if Self.isInlineImageType(attachment.typeUTI) {
             return generateImageHTML(
                 attachment: attachment,
                 uuid: uuid,
                 relativePath: relativePath,
                 embedInline: embedImages,
-                wrapInLink: linkEmbeddedImages
+                wrapInLink: linkEmbeddedImages,
+                standalonePDF: standalonePDF
             )
         }
 
         // Check if this is a table
         if attachment.typeUTI == "com.apple.notes.table" {
-            return generateTableHTML(uuid: uuid)
+            let tableHTML = generateTableHTML(uuid: uuid)
+            if standalonePDF, tableHTML == "[Table could not be rendered]" {
+                markIncomplete(attachment, reason: "the Notes table could not be rendered")
+            }
+            return tableHTML
         }
 
         // Check if this is a URL link card
         if attachment.typeUTI == "public.url" {
-            return generateURLCardHTML(uuid: uuid)
+            return generateURLCardHTML(uuid: uuid, attachment: attachment, standalonePDF: standalonePDF)
         }
 
         // Check if this is a PDF
         if attachment.typeUTI == "com.adobe.pdf" || attachment.typeUTI == "public.pdf" {
+            if standalonePDF {
+                markIncomplete(attachment, reason: "the original PDF file is not embedded")
+                return generateStandaloneFileReferenceHTML(
+                    filename: attachment.filename ?? "PDF document",
+                    description: "Original PDF file not embedded in this PDF"
+                )
+            }
             return generatePDFLinkHTML(attachment: attachment, relativePath: relativePath)
+        }
+
+        if standalonePDF {
+            markIncomplete(attachment, reason: "the original file is not embedded")
+            return generateStandaloneFileReferenceHTML(
+                filename: attachment.filename ?? attachment.name,
+                description: "Original file not embedded in this PDF (\(getTypeDescription(for: attachment.typeUTI)))"
+            )
         }
 
         // For other attachments, generate a styled link
@@ -194,14 +249,34 @@ class HTMLAttachmentProcessor {
         uuid: String,
         relativePath: String?,
         embedInline: Bool,
-        wrapInLink: Bool
+        wrapInLink: Bool,
+        standalonePDF: Bool
     ) -> String {
         let altText = (attachment.filename ?? "image").htmlEscaped
         let safePath = relativePath?.htmlEscaped
 
-        // Try to get base64-encoded image data first (works for both embedded and external images)
-        if let base64 = getImageBase64(uuid: uuid, typeUTI: attachment.typeUTI, relativePath: relativePath) {
-            let mimeType = utiToMimeType(attachment.typeUTI)
+        // Prefer the database's original bytes, then an exported staging file.
+        // For standalone PDFs the data URI is the only acceptable image source:
+        // a link into the staging folder would break as soon as export returns.
+        if let imageData = getImageData(uuid: uuid, relativePath: relativePath) {
+            let base64: String
+            let mimeType: String
+            if standalonePDF {
+                guard let (renderableData, detectedMimeType) = renderableImageData(
+                    imageData, typeUTI: attachment.typeUTI
+                ) else {
+                    markIncomplete(attachment, reason: "image bytes were unavailable or could not be decoded")
+                    return "<span style=\"color:#8b1e1e;\">[Image unavailable: \(altText)]</span>"
+                }
+                base64 = renderableData.base64EncodedString()
+                mimeType = detectedMimeType
+            } else {
+                // Keep the established CLI/MCP/backup HTML behavior exactly:
+                // standalone PDFs use byte-detected, renderable data URIs,
+                // while existing export surfaces retain their UTI mapping.
+                base64 = legacyImageBase64(imageData, typeUTI: attachment.typeUTI)
+                mimeType = utiToMimeType(attachment.typeUTI)
+            }
             let imgTag = "<img src=\"data:\(mimeType);base64,\(base64)\" alt=\"\(altText)\" />"
 
             // If embedInline is false but we have a relativePath, use the path instead
@@ -215,6 +290,11 @@ class HTMLAttachmentProcessor {
             }
 
             return imgTag
+        }
+
+        if standalonePDF {
+            markIncomplete(attachment, reason: "image bytes were unavailable or could not be decoded")
+            return "<span style=\"color:#8b1e1e;\">[Image unavailable: \(altText)]</span>"
         }
 
         // Fall back to linking to the file if base64 failed
@@ -241,12 +321,23 @@ class HTMLAttachmentProcessor {
     }
 
     /// Generate HTML for URL link card attachments
-    private func generateURLCardHTML(uuid: String) -> String {
+    private func generateURLCardHTML(
+        uuid: String,
+        attachment: NotesAttachment,
+        standalonePDF: Bool
+    ) -> String {
         Logger.noteQuery.debug("Processing URL link card with UUID: \(uuid)")
 
         // Try to fetch URL and title from database
         if let (url, title) = fetchURLLinkCard(uuid: uuid) {
+            guard !standalonePDF || isSafeExternalURL(url) else {
+                markIncomplete(attachment, reason: "the link card does not contain a safe HTTP or HTTPS URL")
+                return "[Link unavailable: \((attachment.filename ?? url).htmlEscaped)]"
+            }
             Logger.noteQuery.debug("Successfully fetched URL link card: url=\(url), title=\(title ?? "nil")")
+            if standalonePDF {
+                notices.append("Link card '\(attachment.filename ?? title ?? url)' remains an external web link; the linked page is not downloaded or embedded.")
+            }
             let displayTitle = title ?? url
             return """
             <div style="border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 8px 0; background: #f9f9f9; display: flex; align-items: center; font-size: 14px; font-weight: normal; font-style: normal; text-decoration: none;">
@@ -260,6 +351,9 @@ class HTMLAttachmentProcessor {
         }
 
         Logger.noteQuery.warning("Could not fetch URL data for link card \(uuid)")
+        if standalonePDF {
+            markIncomplete(attachment, reason: "the link card URL could not be read")
+        }
         return "<div style=\"color: #999; font-style: italic;\">[URL Link Card]</div>"
     }
 
@@ -298,6 +392,41 @@ class HTMLAttachmentProcessor {
         """
     }
 
+    private func generateStandaloneFileReferenceHTML(filename: String, description: String) -> String {
+        """
+        <div style="border: 1px solid #d8d8d8; border-radius: 6px; padding: 10px; margin: 8px 0; color: #333;">
+            <strong>📎 \(filename.htmlEscaped)</strong>
+            <div style="font-size: 12px; color: #666; margin-top: 4px;">\(description.htmlEscaped). Only a reference is shown; the original file is not embedded.</div>
+        </div>
+        """
+    }
+
+    private func markIncomplete(_ attachment: NotesAttachment, reason: String) {
+        incompleteAttachmentIDs.insert(attachment.id)
+        let label = attachment.filename ?? attachment.id
+        diagnostics.append("Attachment '\(label)' (\(attachment.typeUTI)) is incomplete in the standalone PDF: \(reason).")
+    }
+
+    private func representedAttachmentIDs(in html: String) -> Set<String> {
+        let pattern = #"<span\s+data-attachment-id="([^"]+)"\s+data-attachment-type="[^"]+">.*?</span>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return []
+        }
+        let nsHTML = html as NSString
+        return Set(regex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length)).compactMap { match in
+            guard match.numberOfRanges > 1 else { return nil }
+            return nsHTML.substring(with: match.range(at: 1))
+        })
+    }
+
+    private func isSafeExternalURL(_ value: String) -> Bool {
+        guard let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host != nil else { return false }
+        return true
+    }
+
     /// Get an appropriate emoji icon for a file type
     private func getFileIcon(for typeUTI: String) -> String {
         if typeUTI.contains("video") || typeUTI.contains("movie") || typeUTI.contains("mp4") || typeUTI.contains("mov") {
@@ -322,7 +451,12 @@ class HTMLAttachmentProcessor {
             "public.mp3": "MP3 Audio",
             "public.text": "Text File",
             "public.plain-text": "Plain Text",
-            "public.zip-archive": "ZIP Archive"
+            "public.zip-archive": "ZIP Archive",
+            "org.openxmlformats.wordprocessingml.document": "Word Document",
+            "com.microsoft.word.doc": "Microsoft Word Document",
+            "com.microsoft.word.docx": "Microsoft Word Document",
+            "net.daringfireball.markdown": "Markdown Document",
+            "public.markdown": "Markdown Document"
         ]
 
         if let description = descriptions[typeUTI] {
@@ -417,7 +551,7 @@ class HTMLAttachmentProcessor {
     }
 
     /// Get base64-encoded image data from database or exported file
-    private func getImageBase64(uuid: String, typeUTI: String, relativePath: String?) -> String? {
+    private func getImageData(uuid: String, relativePath: String?) -> Data? {
         // Query for the media blob
         let query = """
         SELECT ZMEDIA
@@ -429,7 +563,7 @@ class HTMLAttachmentProcessor {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else {
             Logger.noteQuery.error("Failed to prepare image query for UUID \(uuid)")
-            return tryLoadFromFile(relativePath: relativePath, uuid: uuid)
+            return tryLoadImageDataFromFile(relativePath: relativePath, uuid: uuid)
         }
         defer { sqlite3_finalize(statement) }
 
@@ -437,7 +571,7 @@ class HTMLAttachmentProcessor {
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             Logger.noteQuery.debug("No media data found in ZMEDIA for UUID \(uuid), trying external file")
-            return tryLoadFromFile(relativePath: relativePath, uuid: uuid, typeUTI: typeUTI)
+            return tryLoadImageDataFromFile(relativePath: relativePath, uuid: uuid)
         }
 
         // Get the blob data
@@ -445,33 +579,23 @@ class HTMLAttachmentProcessor {
             let size = sqlite3_column_bytes(statement, 0)
 
             // If size is very small (< 100 bytes), it's likely just a reference, not actual image data
-            if size < 100 {
-                Logger.noteQuery.debug("ZMEDIA has only \(size) bytes for UUID \(uuid) - likely a reference, trying external file")
-                return tryLoadFromFile(relativePath: relativePath, uuid: uuid, typeUTI: typeUTI)
+            let data = Data(bytes: blob, count: Int(size))
+            if size < 100 && imageMimeType(from: data) == nil {
+                Logger.noteQuery.debug("ZMEDIA has only \(size) non-image bytes for UUID \(uuid) - likely a reference, trying external file")
+                return tryLoadImageDataFromFile(relativePath: relativePath, uuid: uuid)
             }
 
-            let data = Data(bytes: blob, count: Int(size))
             Logger.noteQuery.debug("Successfully retrieved \(size) bytes of image data from ZMEDIA for UUID \(uuid)")
 
-            // Convert HEIC to JPEG to avoid WebKit rendering issues
-            if typeUTI.contains("heic") || typeUTI.contains("HEIC") {
-                if let convertedData = convertHEICToJPEG(data) {
-                    Logger.noteQuery.debug("Converted HEIC to JPEG for UUID \(uuid), new size: \(convertedData.count) bytes")
-                    return convertedData.base64EncodedString()
-                } else {
-                    Logger.noteQuery.warning("Failed to convert HEIC to JPEG for UUID \(uuid), using original data")
-                }
-            }
-
-            return data.base64EncodedString()
+            return data
         }
 
         Logger.noteQuery.warning("ZMEDIA column was NULL for UUID \(uuid), trying external file")
-        return tryLoadFromFile(relativePath: relativePath, uuid: uuid, typeUTI: typeUTI)
+        return tryLoadImageDataFromFile(relativePath: relativePath, uuid: uuid)
     }
 
-    /// Try to load image data from the exported file
-    private func tryLoadFromFile(relativePath: String?, uuid: String, typeUTI: String = "") -> String? {
+    /// Try to load image bytes from the exported file
+    private func tryLoadImageDataFromFile(relativePath: String?, uuid: String) -> Data? {
         guard let relativePath = relativePath, let exportDir = exportDirectory else {
             Logger.noteQuery.debug("Cannot load from file - no relativePath or exportDirectory for UUID \(uuid)")
             return nil
@@ -484,17 +608,7 @@ class HTMLAttachmentProcessor {
             let data = try Data(contentsOf: URL(fileURLWithPath: fullPath))
             Logger.noteQuery.debug("Successfully loaded \(data.count) bytes from external file for UUID \(uuid)")
 
-            // Convert HEIC to JPEG to avoid WebKit rendering issues
-            if typeUTI.contains("heic") || typeUTI.contains("HEIC") || fullPath.hasSuffix(".heic") || fullPath.hasSuffix(".HEIC") {
-                if let convertedData = convertHEICToJPEG(data) {
-                    Logger.noteQuery.debug("Converted external HEIC to JPEG for UUID \(uuid), new size: \(convertedData.count) bytes")
-                    return convertedData.base64EncodedString()
-                } else {
-                    Logger.noteQuery.warning("Failed to convert external HEIC to JPEG for UUID \(uuid), using original data")
-                }
-            }
-
-            return data.base64EncodedString()
+            return data
         } catch {
             Logger.noteQuery.warning("Failed to load image from file \(fullPath): \(error.localizedDescription)")
             return nil
@@ -526,6 +640,62 @@ class HTMLAttachmentProcessor {
         }
 
         return jpegData
+    }
+
+    /// Returns bytes and a MIME type that the HTML renderer can actually load.
+    /// MIME is identified from the bytes rather than guessed from a broad UTI.
+    private func renderableImageData(_ data: Data, typeUTI: String) -> (Data, String)? {
+        let isHEIC = typeUTI.localizedCaseInsensitiveContains("heic")
+            || typeUTI.localizedCaseInsensitiveContains("heif")
+            || imageMimeType(from: data) == "image/heic"
+        if isHEIC {
+            if let jpeg = convertHEICToJPEG(data), imageMimeType(from: jpeg) == "image/jpeg" {
+                return (jpeg, "image/jpeg")
+            }
+            return nil
+        }
+
+        if let mimeType = imageMimeType(from: data) {
+            guard mimeType != "image/avif" else { return nil }
+            return (data, mimeType)
+        }
+
+        // Apple drawing/scanned-image payloads are not always stored as a
+        // standard raster file. Decode with AppKit and normalize only if it
+        // succeeds; otherwise report a missing image rather than inventing PNG.
+        if let image = NSImage(data: data),
+           let tiff = image.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiff),
+           let png = bitmap.representation(using: .png, properties: [:]) {
+            return (png, "image/png")
+        }
+
+        return nil
+    }
+
+    private func legacyImageBase64(_ data: Data, typeUTI: String) -> String {
+        if typeUTI.localizedCaseInsensitiveContains("heic") || typeUTI.localizedCaseInsensitiveContains("heif") {
+            if let convertedData = convertHEICToJPEG(data) {
+                return convertedData.base64EncodedString()
+            }
+            Logger.noteQuery.warning("Failed to convert HEIC image, using original bytes for legacy HTML")
+        }
+        return data.base64EncodedString()
+    }
+
+    private func imageMimeType(from data: Data) -> String? {
+        let bytes = [UInt8](data.prefix(16))
+        if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) { return "image/png" }
+        if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+        if bytes.starts(with: Array("GIF87a".utf8)) || bytes.starts(with: Array("GIF89a".utf8)) { return "image/gif" }
+        if bytes.starts(with: [0x49, 0x49, 0x2A, 0x00]) || bytes.starts(with: [0x4D, 0x4D, 0x00, 0x2A]) { return "image/tiff" }
+        if bytes.count >= 12,
+           String(bytes: bytes[4..<8], encoding: .ascii) == "ftyp" {
+            let brand = String(bytes: bytes[8..<12], encoding: .ascii)?.lowercased() ?? ""
+            if ["heic", "heix", "hevc", "hevx", "mif1", "msf1"].contains(brand) { return "image/heic" }
+            if brand == "avif" || brand == "avis" { return "image/avif" }
+        }
+        return nil
     }
 
     /// Convert UTI to MIME type
