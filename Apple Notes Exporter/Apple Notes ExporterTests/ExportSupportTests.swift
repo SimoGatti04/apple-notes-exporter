@@ -23,6 +23,35 @@ import XCTest
 
 final class ExportSupportTests: XCTestCase {
 
+    func test_pdfConfiguration_defaultsAndBackwardCompatibleDecoding() throws {
+        let defaultConfiguration = PDFConfiguration.defaultConfiguration
+        XCTAssertEqual(defaultConfiguration.styleProfile, .study)
+
+        let encoder = JSONEncoder()
+        let encoded = try encoder.encode(defaultConfiguration)
+        let roundTrip = try JSONDecoder().decode(PDFConfiguration.self, from: encoded)
+        XCTAssertEqual(roundTrip.styleProfile, .study)
+        XCTAssertEqual(roundTrip.pageSize, defaultConfiguration.pageSize)
+
+        let legacyJSON = """
+        {
+          "htmlConfiguration": {
+            "fontSizePoints": 14,
+            "fontFamily": "System",
+            "marginSize": 36,
+            "marginUnit": "pt",
+            "embedImagesInline": true,
+            "linkEmbeddedImages": false,
+            "writeFolderIndexes": false
+          },
+          "pageSize": "A4"
+        }
+        """
+        let legacy = try JSONDecoder().decode(PDFConfiguration.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(legacy.styleProfile, .study)
+        XCTAssertEqual(legacy.pageSize, .a4)
+    }
+
     // MARK: - HTML entity decoding
 
     func test_htmlDecoded_decodesNamedDecimalAndHexadecimalEntities() {

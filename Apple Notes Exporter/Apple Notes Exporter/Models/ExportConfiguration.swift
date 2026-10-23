@@ -184,6 +184,36 @@ struct HTMLConfiguration: ExportConfigurable {
 struct PDFConfiguration: ExportConfigurable {
     var htmlConfiguration: HTMLConfiguration
     var pageSize: PageSize
+    var styleProfile: PDFStyleProfile
+
+    private enum CodingKeys: String, CodingKey {
+        case htmlConfiguration, pageSize, styleProfile
+    }
+
+    init(
+        htmlConfiguration: HTMLConfiguration,
+        pageSize: PageSize,
+        styleProfile: PDFStyleProfile = .study
+    ) {
+        self.htmlConfiguration = htmlConfiguration
+        self.pageSize = pageSize
+        self.styleProfile = styleProfile
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        htmlConfiguration = try container.decode(HTMLConfiguration.self, forKey: .htmlConfiguration)
+        pageSize = try container.decode(PageSize.self, forKey: .pageSize)
+        // Configurations saved before PDF profiles were introduced remain valid.
+        styleProfile = try container.decodeIfPresent(PDFStyleProfile.self, forKey: .styleProfile) ?? .study
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(htmlConfiguration, forKey: .htmlConfiguration)
+        try container.encode(pageSize, forKey: .pageSize)
+        try container.encode(styleProfile, forKey: .styleProfile)
+    }
 
     enum PageSize: String, Codable, CaseIterable {
         case letter = "Letter"
@@ -220,7 +250,8 @@ struct PDFConfiguration: ExportConfigurable {
 
         return PDFConfiguration(
             htmlConfiguration: .defaultConfiguration,
-            pageSize: defaultPageSize
+            pageSize: defaultPageSize,
+            styleProfile: .study
         )
     }
 }

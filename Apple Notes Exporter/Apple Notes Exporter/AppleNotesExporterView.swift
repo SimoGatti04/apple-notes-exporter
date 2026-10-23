@@ -67,6 +67,13 @@ struct AppleNotesExporterView: View {
         guard let format = ExportFormat(rawValue: outputFormat) else {
             return
         }
+        guard let destinationURL = outputURL else {
+            self.activeAlert = .noOutput
+            self.showAlert = true
+            return
+        }
+
+        let selectedNotes = notesViewModel.selectedNotes
 
         // Reset
         sharedState.update()
@@ -74,14 +81,20 @@ struct AppleNotesExporterView: View {
         // Show the export progress window
         setProgressWindow(true)
 
-        // Do the export using the new ExportViewModel
+        // A single PDF is a flat, non-overwriting deliverable in the chosen
+        // directory. Multi-note export keeps the established folder/archive
+        // planner and produces one PDF per note rather than merging them.
         Task {
-            await exportViewModel.exportNotes(
-                notesViewModel.selectedNotes,
-                toDirectory: outputURL!,
-                format: format,
-                includeAttachments: exportViewModel.configurations.includeAttachments
-            )
+            if format == .pdf, selectedNotes.count == 1 {
+                await exportViewModel.exportSingleNotePDF(selectedNotes[0], toDirectory: destinationURL)
+            } else {
+                await exportViewModel.exportNotes(
+                    selectedNotes,
+                    toDirectory: destinationURL,
+                    format: format,
+                    includeAttachments: exportViewModel.configurations.includeAttachments
+                )
+            }
         }
     }
     
@@ -99,6 +112,10 @@ struct AppleNotesExporterView: View {
         if exportViewModel.configurations.tarOutput { return .tar }
         if exportViewModel.configurations.concatenateOutput { return .singleFile }
         return .folder
+    }
+
+    private var isSingleNotePDFMode: Bool {
+        selectedFormat == .pdf && notesViewModel.selectedCount == 1
     }
 
     /// Forget the chosen destination when the container changes.
@@ -122,6 +139,7 @@ struct AppleNotesExporterView: View {
     /// archive and a single file are three different things to have not chosen,
     /// so the wording follows the container rather than always saying "folder".
     var missingDestinationTitle: String {
+        if isSingleNotePDFMode { return "No Output Folder Chosen" }
         if let archive = exportViewModel.configurations.archiveFormat {
             return "No \(archive.displayName) Location Chosen"
         }
@@ -132,6 +150,9 @@ struct AppleNotesExporterView: View {
     }
 
     var missingDestinationMessage: String {
+        if isSingleNotePDFMode {
+            return "Choose the folder where the single PDF should be saved."
+        }
         if let archive = exportViewModel.configurations.archiveFormat {
             return "Please choose where you would like the .\(archive.fileExtension) archive to be saved."
         }
@@ -151,6 +172,18 @@ struct AppleNotesExporterView: View {
     /// path under ZIP is fine, since the archive is named inside it.
     func normalizeOutputPathForContainer() {
         guard !outputPath.isEmpty else { return }
+        if isSingleNotePDFMode {
+            var isDirectory: ObjCBool = false
+            let isExistingDirectory = FileManager.default.fileExists(
+                atPath: outputPath,
+                isDirectory: &isDirectory
+            ) && isDirectory.boolValue
+            if !isExistingDirectory {
+                outputPath = ""
+                outputURL = nil
+            }
+            return
+        }
         let ext = (outputPath as NSString).pathExtension.lowercased()
         // Only extensions this app produces are treated as a filename; a
         // directory legitimately called "my.notes" must not be discarded.
@@ -178,6 +211,7 @@ struct AppleNotesExporterView: View {
     /// The filename and type to offer in a save panel, or nil when the
     /// container writes into a directory instead.
     func savePanelTarget() -> (name: String, type: UTType?)? {
+        guard !isSingleNotePDFMode else { return nil }
         if let archive = exportViewModel.configurations.archiveFormat {
             let name = "\(ExportViewModel.zipRootName).\(archive.fileExtension)"
             // .tar has no first-class UTType constant; resolve it by extension
@@ -193,8 +227,10 @@ struct AppleNotesExporterView: View {
     }
 
     func selectOutputFolder() {
-        // ZIP and Single File both produce exactly one file, so the user names
-        // that file rather than picking a directory to be filled.
+        // One-note PDF always writes a uniquely named PDF into a directory,
+        // regardless of advanced multi-note output-container preferences.
+        // ZIP and Single File otherwise produce exactly one file, so the user
+        // names that file rather than picking a directory to be filled.
         if let (suggestedName, contentType) = savePanelTarget() {
             let savePanel = NSSavePanel()
             if let contentType { savePanel.allowedContentTypes = [contentType] }
@@ -379,11 +415,15 @@ struct AppleNotesExporterView: View {
                     HStack(alignment: .center, spacing: 12) {
                         Text("PDF layout")
                             .font(.subheadline.weight(.medium))
-                        ComingSoonLayoutCard(title: "Faithful", detail: "Preserve Notes styling")
-                        ComingSoonLayoutCard(title: "Study", detail: "Reading-focused typography")
-                        Spacer(minLength: 0)
+                        Picker("PDF layout", selection: $exportViewModel.configurations.pdf.styleProfile) {
+                            ForEach(PDFStyleProfile.allCases, id: \.self) { profile in
+                                Text(profile.displayName).tag(profile)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 280)
                     }
-                    Text("Layout profiles are not connected to the PDF renderer yet.")
+                    Text(exportViewModel.configurations.pdf.styleProfile.description)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -408,7 +448,9 @@ struct AppleNotesExporterView: View {
                     Button("Choose…", action: selectOutputFolder)
                 }
                 if selectedFormat == .pdf {
-                    Text("Flat, single-PDF delivery is not connected yet; this build keeps the existing account/folder output layout.")
+                    Text(isSingleNotePDFMode
+                         ? "One PDF is saved directly in this folder. Existing names are never overwritten; supported images are embedded, and unavailable attachments are reported."
+                         : "Multiple notes are exported as individual PDFs using the selected folder, archive, or legacy account/folder layout. They are not combined into one PDF.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -425,7 +467,8 @@ struct AppleNotesExporterView: View {
     }
 
     private var destinationSystemImage: String {
-        exportViewModel.configurations.archiveFormat?.systemImage
+        if isSingleNotePDFMode { return "folder" }
+        return exportViewModel.configurations.archiveFormat?.systemImage
             ?? (exportViewModel.configurations.concatenateOutput ? "doc.text" : "folder")
     }
 
@@ -545,7 +588,14 @@ struct AppleNotesExporterView: View {
                 destinationCard
 
                 DisclosureGroup("Advanced output options", isExpanded: $showAdvancedOutputOptions) {
-                    advancedOutputOptions
+                    if isSingleNotePDFMode {
+                        Text("Single-note PDF always writes one non-overwriting PDF into the chosen folder. Multi-note container, attachment-folder, and sync options do not apply to this export.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        advancedOutputOptions
+                    }
                 }
                 .padding(.horizontal, 4)
 
@@ -598,7 +648,10 @@ struct AppleNotesExporterView: View {
                 sharedState.reload()
             }
         }
-        .onChange(of: notesViewModel.selectedCount) { _ in sharedState.update() }
+        .onChange(of: notesViewModel.selectedCount) { _ in
+            normalizeOutputPathForContainer()
+            sharedState.update()
+        }
         .onReceive(syncTimer) { now = $0 }
         .onChange(of: sharedState.triggerSelectNotes) { triggered in
             if triggered {
@@ -635,6 +688,7 @@ struct AppleNotesExporterView: View {
         .onChange(of: exportViewModel.configurations.addDateToFilename) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.filenameDateFormat) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.styleProfile) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.incrementalSync) { _ in
@@ -741,24 +795,6 @@ private extension View {
         } else {
             transformEffect(.identity)
         }
-    }
-}
-
-private struct ComingSoonLayoutCard: View {
-    let title: String
-    let detail: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.subheadline.weight(.medium))
-            Text(detail).font(.caption)
-        }
-        .foregroundColor(.secondary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 7).fill(SwiftUI.Color.secondary.opacity(0.08)))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title) PDF layout, coming soon")
     }
 }
 

@@ -1,6 +1,12 @@
 # Architecture and integration contracts
 
-Status: initial design contract for independent worktrees. No code implementation implied. Change shared contracts only via integrator review, not concurrent agent edits.
+Status: design contract implemented and integrated for the first P2 vertical slice on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). This is not a claim that every target capability below is implemented. Change shared contracts only via integrator review, not concurrent agent edits.
+
+## Current implementation snapshot
+- Parser semantic classes are consumed by the PDF styling helper in the app's standalone PDF path.
+- The app persists Faithful/Study selection (Study default) and routes one-note PDF export through the flat standalone exporter. Multi-note PDF export remains one file per note; merge-to-one-PDF is deferred.
+- CSS owns the standalone PDF page margins while AppKit print margins are set to zero, avoiding the previously identified double-margin path. Non-PDF HTML keeps its legacy wrapper.
+- Inline images and supported HTML content can be represented in the PDF. Generic file attachments and Notes galleries are not embedded as portable originals; they are explicitly marked incomplete. See the validation report for exact evidence and other gaps.
 
 ## Existing source (inspected)
 - `Apple Notes Exporter/Apple Notes Exporter/AppleNotesKit/`: C database/attachment parser. Preserve, read-only access.

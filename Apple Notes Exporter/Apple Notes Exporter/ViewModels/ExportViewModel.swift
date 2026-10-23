@@ -654,14 +654,13 @@ class ExportViewModel: ObservableObject {
 
             let stagedPDF = staging.appendingPathComponent("rendered.pdf")
             let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
-            let margins = standaloneHTMLConfig.toNSEdgeInsets()
             let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
             log("Rendering standalone PDF...")
             try await renderPDFHTML(
                 paginatedHTML,
                 to: stagedPDF,
                 pageSize: pageSizeCG,
-                margins: margins
+                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
             )
 
             try Task.checkCancellation()
@@ -1309,7 +1308,7 @@ class ExportViewModel: ObservableObject {
                 paginatedHTML,
                 to: fileURL,
                 pageSize: pageSizeCG,
-                margins: marginsNS,
+                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0),
                 baseURL: directory
             )
 
@@ -1600,13 +1599,34 @@ class ExportViewModel: ObservableObject {
         // so any note with an attachment kept a nested <html><body>.
         processedHTML = extractHTMLBody(processedHTML)
 
-        // Build CSS for font and margin
+        if forPDF {
+            let configuredSize = configurations.pdf.pageSize.dimensions
+            let options = PDFDocumentOptions(
+                profile: configurations.pdf.styleProfile,
+                pageSize: pdfPageSize ?? CGSize(width: configuredSize.width, height: configuredSize.height),
+                pageMargins: pdfMargins ?? htmlConfig.toNSEdgeInsets(),
+                fontFamily: htmlConfig.fontFamily.cssFontStack,
+                baseFontSizePoints: htmlConfig.fontSizePoints,
+                // WebKit honors CSS @page margins but ignores NSPrintInfo
+                // margins for this content. Apply the configured margin in CSS
+                // and pass zero to NSPrintInfo so it is applied exactly once.
+                embedPageMarginsInCSS: true,
+                showHeader: false
+            )
+            return notePDFHTMLDocument(
+                title: note.title,
+                created: dateFormatter.string(from: note.creationDate),
+                modified: dateFormatter.string(from: note.modificationDate),
+                options: options,
+                body: processedHTML
+            )
+        }
+
+        // Keep the legacy document wrapper for non-PDF exports. CLI/MCP use
+        // their independent compatibility path and are not changed here.
         let fontFamily = htmlConfig.fontFamily.cssFontStack
         let fontSize = "\(htmlConfig.fontSizePoints)pt"
-
-        // For PDF, margins are handled by PDFConfiguration (set body margin to 0)
-        // For HTML export, use the configured margin value
-        let marginValue = forPDF ? "0" : "\(htmlConfig.marginSize)\(htmlConfig.marginUnit.displayName)"
+        let marginValue = "\(htmlConfig.marginSize)\(htmlConfig.marginUnit.displayName)"
 
         return noteHTMLDocument(
             title: note.title,
@@ -1615,8 +1635,7 @@ class ExportViewModel: ObservableObject {
             fontFamily: fontFamily,
             fontSize: fontSize,
             margin: marginValue,
-            imageConstraint: imageHeightConstraint(
-                forPDF: forPDF, pageSize: pdfPageSize, margins: pdfMargins),
+            imageConstraint: imageHeightConstraint(forPDF: false, pageSize: nil, margins: nil),
             body: processedHTML
         )
     }

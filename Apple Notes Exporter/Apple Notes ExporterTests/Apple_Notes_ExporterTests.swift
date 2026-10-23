@@ -275,6 +275,42 @@ final class NoteHTMLGeneratorFormattingTests: XCTestCase {
         XCTAssertTrue(html.contains("<ul><li><b>First</b></li></ul>"))
         XCTAssertEqual(plaintext(from: html), text)
     }
+
+    func test_styleChangeInsideListItemKeepsBalancedStructureAndText() {
+        let text = "FirstSecond"
+        var first = run("First")
+        first.fontWeight = 1
+        first.paragraphStyle = ParagraphStyle()
+        first.paragraphStyle.styleType = 100
+
+        var second = run("Second")
+        second.emphasisStyle = 1
+        second.paragraphStyle = first.paragraphStyle
+
+        let html = NoteHTMLGenerator(database: nil).generateHTML(from: note(text, runs: [first, second]))
+
+        XCTAssertTrue(html.contains("<ul><li><b>First</b><mark class=\"ane-highlight ane-highlight-purple\">Second</mark></li></ul>"))
+        XCTAssertEqual(html.components(separatedBy: "<li>").count - 1, 1)
+        XCTAssertEqual(html.components(separatedBy: "</li>").count - 1, 1)
+        XCTAssertEqual(plaintext(from: html), text)
+    }
+
+    func test_styleChangeInsideParagraphFragmentKeepsBalancedInlineMarkup() {
+        let text = "plain highlighted plain"
+        let plainBefore = run("plain ")
+        var highlighted = run("highlighted")
+        highlighted.emphasisStyle = 3
+        let plainAfter = run(" plain")
+
+        let html = NoteHTMLGenerator(database: nil).generateHTML(
+            from: note(text, runs: [plainBefore, highlighted, plainAfter])
+        )
+
+        XCTAssertTrue(html.contains("plain <mark class=\"ane-highlight ane-highlight-orange\">highlighted</mark> plain"))
+        XCTAssertEqual(html.components(separatedBy: "<mark ").count - 1, 1)
+        XCTAssertEqual(html.components(separatedBy: "</mark>").count - 1, 1)
+        XCTAssertEqual(plaintext(from: html), text)
+    }
 }
 
 

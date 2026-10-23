@@ -94,12 +94,13 @@ final class EngineParityTests: XCTestCase {
     }
 
     private func makeNote(
+        id: String = "synthetic-note",
         title: String = "Flat Note",
         htmlBody: String = "<html><body><p>Standalone PDF body</p></body></html>",
         attachments: [NotesAttachment] = []
     ) -> NotesNote {
         NotesNote(
-            id: "synthetic-note", title: title, plaintext: "Standalone PDF body", htmlBody: htmlBody,
+            id: id, title: title, plaintext: "Standalone PDF body", htmlBody: htmlBody,
             creationDate: Date(timeIntervalSince1970: 1_700_000_000),
             modificationDate: Date(timeIntervalSince1970: 1_700_000_100),
             folderId: "1", accountId: "1", attachments: attachments
@@ -162,6 +163,30 @@ final class EngineParityTests: XCTestCase {
         NSGraphicsContext.restoreGraphicsState()
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             throw NSError(domain: "EngineParityTests.Image", code: 2)
+        }
+        return png
+    }
+
+    private func makeLandscapePNG() throws -> Data {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 240, pixelsHigh: 120,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            throw NSError(domain: "EngineParityTests.Image", code: 3)
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor(calibratedRed: 0.82, green: 0.91, blue: 1.0, alpha: 1.0).setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 240, height: 120)).fill()
+        NSColor(calibratedRed: 0.88, green: 0.20, blue: 0.22, alpha: 1.0).setFill()
+        NSBezierPath(ovalIn: NSRect(x: 20, y: 20, width: 80, height: 80)).fill()
+        NSColor(calibratedRed: 0.12, green: 0.35, blue: 0.78, alpha: 1.0).setFill()
+        NSBezierPath(rect: NSRect(x: 120, y: 24, width: 96, height: 72)).fill()
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw NSError(domain: "EngineParityTests.Image", code: 4)
         }
         return png
     }
@@ -259,6 +284,63 @@ final class EngineParityTests: XCTestCase {
         XCTAssertEqual(viewModel.lastExportArtifactURL?.lastPathComponent, "Flat Note.pdf")
         XCTAssertEqual(flatPDFStagingPaths(), stagingBefore)
         XCTAssertNotNil(PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")))
+    }
+
+    func test_standalonePDFUsesSelectedProfileForStyledNoteContent() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        let imageBase64 = try makeLandscapePNG().base64EncodedString()
+        let body = """
+        <h1>Profile rendering marker</h1>
+        <p>Inline <mark class="ane-highlight ane-highlight-purple">highlight</mark> survives.</p>
+        <pre class="ane-monostyle">let answer = 42</pre>
+        <figure><img alt="Synthetic landscape illustration" src="data:image/png;base64,\(imageBase64)"></figure>
+        <table><tr><th>Topic</th></tr><tr><td>Rendering</td></tr></table>
+        <div class="page-break"></div>
+        <h2>Following page marker</h2>
+        <p>Page-break content remains readable and selectable.</p>
+        """
+        var pageImages: [Data] = []
+        for profile in PDFStyleProfile.allCases {
+            var configurations = ExportConfigurations.default
+            configurations.pdf.styleProfile = profile
+            viewModel.configurations = configurations
+            await viewModel.exportSingleNotePDF(
+                makeNote(title: "Profile \(profile.rawValue)", htmlBody: "<html><body>\(body)</body></html>"),
+                toDirectory: output
+            )
+            guard case .completed = viewModel.exportState,
+                  let artifact = viewModel.lastExportArtifactURL,
+                  let pdf = PDFDocument(url: artifact),
+                  pdf.pageCount >= 2,
+                  let page = pdf.page(at: 0),
+                  let tiff = page.thumbnail(of: CGSize(width: 595, height: 842), for: .mediaBox).tiffRepresentation,
+                  let text = pdf.string else {
+                return XCTFail("Expected a rendered PDF using the \(profile.displayName) profile")
+            }
+            XCTAssertTrue(text.contains("Profile rendering marker"))
+            XCTAssertTrue(text.contains("highlight"))
+            XCTAssertTrue(text.contains("answer = 42"))
+            XCTAssertTrue(text.contains("Rendering"))
+            XCTAssertTrue(text.contains("Following page marker"))
+            for pageIndex in 0..<pdf.pageCount {
+                guard let pageImage = pdf.page(at: pageIndex)?.thumbnail(
+                    of: CGSize(width: 595, height: 842), for: .mediaBox
+                ).tiffRepresentation else {
+                    XCTFail("Could not capture page \(pageIndex + 1) for the \(profile.displayName) visual check")
+                    continue
+                }
+                let attachment = XCTAttachment(data: pageImage, uniformTypeIdentifier: "public.tiff")
+                attachment.name = "\(profile.displayName) PDF page \(pageIndex + 1)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+            pageImages.append(tiff)
+        }
+        XCTAssertNotEqual(pageImages[0], pageImages[1], "Faithful and Study should render the same semantic content with distinct layouts")
     }
 
     func test_standalonePDFPaginatesAtConfiguredSizeAndKeepsTextSelectable() async throws {
@@ -540,6 +622,46 @@ final class EngineParityTests: XCTestCase {
             .filter { $0.pathExtension.lowercased() == "pdf" } ?? []
         XCTAssertEqual(pdfs.count, 1)
         XCTAssertGreaterThan(pdfs[0].pathComponents.count, output.pathComponents.count + 1)
+    }
+
+    func test_multiNotePDFExportDeliversOnePDFPerSelectedNote() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        let notes = [
+            makeNote(
+                id: "selected-note-1",
+                title: "First Selected Note",
+                htmlBody: "<html><body><p>First selected marker</p></body></html>"
+            ),
+            makeNote(
+                id: "selected-note-2",
+                title: "Second Selected Note",
+                htmlBody: "<html><body><p>Second selected marker</p></body></html>"
+            )
+        ]
+
+        await viewModel.exportNotes(notes, toDirectory: output, format: .pdf, includeAttachments: false)
+
+        guard case .completed = viewModel.exportState else {
+            return XCTFail("Expected multi-note PDF export to complete")
+        }
+        let pdfs = (FileManager.default.enumerator(at: output, includingPropertiesForKeys: [.isRegularFileKey]))?
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension.lowercased() == "pdf" } ?? []
+        XCTAssertEqual(Set(pdfs.map(\.lastPathComponent)), ["First Selected Note.pdf", "Second Selected Note.pdf"])
+        XCTAssertEqual(pdfs.count, 2, "Multi-note PDF export should not silently merge selected notes")
+
+        let exportedText = try pdfs.map { url -> String in
+            guard let pdf = PDFDocument(url: url), let text = pdf.string else {
+                throw NSError(domain: "EngineParityTests.PDF", code: 1)
+            }
+            return text
+        }
+        XCTAssertTrue(exportedText.contains { $0.contains("First selected marker") })
+        XCTAssertTrue(exportedText.contains { $0.contains("Second selected marker") })
     }
 
     func test_appAndCLIProduceTheSameFilesForEveryTextFormat() async throws {
