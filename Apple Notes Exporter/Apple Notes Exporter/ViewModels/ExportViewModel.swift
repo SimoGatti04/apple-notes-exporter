@@ -19,9 +19,11 @@
 //
 
 import Foundation
+import AppKit
 import SwiftUI
 import OSLog
-import HtmlToPdf
+import PDFKit
+import WebKit
 
 // MARK: - Export Errors
 
@@ -29,15 +31,24 @@ enum ExportError: Error, LocalizedError {
     case pdfGenerationTimeout
     case invalidPDFDestinationDirectory(String)
     case tooManyPDFNameCollisions
+    case pdfNavigationFailed(String)
+    case invalidGeneratedPDF
+    case pdfPrintFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .pdfGenerationTimeout:
-            return "PDF generation timed out after 60 seconds. This note may contain many large images or corrupted attachments."
+            return "PDF generation exceeded its time limit. This note may contain many large images or corrupted attachments."
         case .invalidPDFDestinationDirectory(let name):
             return "The selected PDF destination is not an existing folder: \(name)"
         case .tooManyPDFNameCollisions:
             return "Could not choose an unused filename for the PDF after 10,000 attempts."
+        case .pdfNavigationFailed(let message):
+            return "Could not load note content for PDF rendering: \(message)"
+        case .invalidGeneratedPDF:
+            return "The PDF renderer produced an invalid or empty document."
+        case .pdfPrintFailed(let message):
+            return "AppKit could not finish PDF printing: \(message)"
         }
     }
 }
@@ -78,6 +89,91 @@ enum ExportState: Equatable {
     }
 }
 
+// MARK: - Main-actor WebKit navigation completion
+
+@MainActor
+private final class PDFNavigationDelegate: NSObject, WKNavigationDelegate {
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func load(_ html: String, in webView: WKWebView, baseURL: URL?) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            guard webView.loadHTMLString(html, baseURL: baseURL) != nil else {
+                finish(.failure(ExportError.pdfNavigationFailed("WebKit did not start HTML loading.")))
+                return
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        finish(.success(()))
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        finish(.failure(ExportError.pdfNavigationFailed("The WebKit content process terminated.")))
+    }
+
+    func cancel() {
+        finish(.failure(CancellationError()))
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(with: result)
+    }
+}
+
+private final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    @MainActor
+    func run(_ operation: NSPrintOperation, window: NSWindow) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+
+            operation.runModal(
+                for: window,
+                delegate: self,
+                didRun: #selector(printOperationDidRun(_:success:contextInfo:)),
+                contextInfo: nil
+            )
+        }
+    }
+
+    @objc private func printOperationDidRun(
+        _ operation: NSPrintOperation,
+        success: Bool,
+        contextInfo: UnsafeMutableRawPointer?
+    ) {
+        // NSPrintOperation may call its delegate on the worker thread when
+        // canSpawnSeparateThread is enabled. Resume the continuation without
+        // touching actor-isolated or unsynchronized state from that callback.
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+
+        guard let continuation else { return }
+        if success {
+            continuation.resume()
+        } else {
+            continuation.resume(throwing: ExportError.pdfPrintFailed("The print operation reported failure or cancellation."))
+        }
+    }
+}
+
 // MARK: - Export ViewModel
 
 @MainActor
@@ -102,6 +198,13 @@ class ExportViewModel: ObservableObject {
     /// flat-PDF export. The IDs let multiple diagnostics for one attachment be
     /// reported without inflating the final partial-failure count.
     private var flatPDFIncompleteAttachmentIDs: Set<String> = []
+
+    /// WebViews currently owned by structured PDF rendering tasks. Cancellation
+    /// and timeout watchers stop navigation, while the task group still waits
+    /// for WebKit's PDF callback before releasing each instance.
+    private var activePDFWebViews: [UUID: WKWebView] = [:]
+    private var activePDFNavigationDelegates: [UUID: PDFNavigationDelegate] = [:]
+    private var timedOutPDFRenderIDs: Set<UUID> = []
 
     // MARK: - Concurrency Settings
 
@@ -550,12 +653,16 @@ class ExportViewModel: ObservableObject {
             )
 
             let stagedPDF = staging.appendingPathComponent("rendered.pdf")
-            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
-                margins: standaloneHTMLConfig.toPDFEdgeInsets(),
-                paperSize: CGSize(width: pageSize.width, height: pageSize.height)
-            )
+            let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
+            let margins = standaloneHTMLConfig.toNSEdgeInsets()
+            let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
             log("Rendering standalone PDF...")
-            try await renderFlatPDF(html, to: stagedPDF, configuration: pdfConfiguration)
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: stagedPDF,
+                pageSize: pageSizeCG,
+                margins: margins
+            )
 
             try Task.checkCancellation()
             if shouldCancel { throw CancellationError() }
@@ -599,32 +706,211 @@ class ExportViewModel: ObservableObject {
         }
     }
 
-    private func renderFlatPDF(
+    /// Render and atomically write a PDF using a WebKit view owned by this
+    /// main-actor-isolated export. HtmlToPdf's renderer enters its dependency
+    /// cache from a task-group worker; under Xcode 27's XCTest context this
+    /// crashes while reflecting Swift Testing's current Test.ID. Keeping
+    /// WebKit creation, navigation, and PDF capture on MainActor avoids that
+    /// dependency path and gives this export explicit ownership of the view.
+    ///
+    /// The timeout/cancellation tasks are structured: on either event they
+    /// stop outstanding navigation and cancel the render child, but leaving
+    /// this scope also waits for AppKit's in-flight print callback. AppKit
+    /// exposes no cancellation method for a running NSPrintOperation, so a
+    /// cancellation can take until printing completes. The PDF is written only after
+    /// that callback completes, cancellation is rechecked, and PDFKit validates
+    /// the resulting document. This avoids abandoned render tasks and partial
+    /// output files. If WebKit is unresponsive during PDF capture, cancellation
+    /// may take until WebKit completes; we deliberately do not return while it
+    /// can still be rendering.
+    private func renderPDFHTML(
         _ html: String,
         to url: URL,
-        configuration: HtmlToPdf.PDFConfiguration
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL? = nil,
+        timeoutSeconds: UInt64 = 60
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await html.print(to: url, configuration: configuration)
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        let renderID = UUID()
+        let timeoutNanoseconds = timeoutSeconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let timeout = timeoutNanoseconds.overflow ? UInt64.max : timeoutNanoseconds.partialValue
+        let pdfData: Data
+        do {
+            pdfData = try await withThrowingTaskGroup(of: Data.self) { group in
+                group.addTask { @MainActor in
+                    try await self.createPDFData(
+                        html,
+                        pageSize: pageSize,
+                        margins: margins,
+                        baseURL: baseURL,
+                        renderID: renderID
+                    )
+                }
+                group.addTask { [weak self] in
+                    try await Task.sleep(nanoseconds: timeout)
+                    await self?.markPDFRenderTimedOutAndStop(renderID)
+                    throw ExportError.pdfGenerationTimeout
+                }
+                group.addTask { [weak self] in
+                    do {
+                        while true {
+                            try Task.checkCancellation()
+                            guard let self else { throw CancellationError() }
+                            if await self.isPDFCancellationRequested() {
+                                await self.stopPDFRender(renderID)
+                                throw CancellationError()
+                            }
+                            try await Task.sleep(nanoseconds: 50_000_000)
+                        }
+                    } catch {
+                        // Task.sleep itself throws on cancellation. Always
+                        // stop this render before the task-group joins it.
+                        await self?.stopPDFRender(renderID)
+                        throw error
+                    }
+                }
+
+                guard let data = try await group.next() else {
+                    throw ExportError.invalidGeneratedPDF
+                }
+                group.cancelAll()
+                return data
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 60_000_000_000)
+        } catch {
+            if timedOutPDFRenderIDs.remove(renderID) != nil {
                 throw ExportError.pdfGenerationTimeout
             }
-            group.addTask {
-                while true {
-                    try Task.checkCancellation()
-                    if await MainActor.run(body: { self.shouldCancel }) {
-                        throw CancellationError()
-                    }
-                    try await Task.sleep(nanoseconds: 50_000_000)
-                }
-            }
-
-            try await group.next()
-            group.cancelAll()
+            if Task.isCancelled || shouldCancel { throw CancellationError() }
+            throw error
         }
+        if timedOutPDFRenderIDs.remove(renderID) != nil {
+            throw ExportError.pdfGenerationTimeout
+        }
+
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        guard let document = PDFDocument(data: pdfData), document.pageCount > 0 else {
+            throw ExportError.invalidGeneratedPDF
+        }
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        try pdfData.write(to: url, options: .atomic)
+    }
+
+    @MainActor
+    private func createPDFData(
+        _ html: String,
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL?,
+        renderID: UUID
+    ) async throws -> Data {
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        let webView = WKWebView(frame: CGRect(origin: .zero, size: pageSize))
+        let navigationDelegate = PDFNavigationDelegate()
+        activePDFWebViews[renderID] = webView
+        activePDFNavigationDelegates[renderID] = navigationDelegate
+        webView.navigationDelegate = navigationDelegate
+        defer {
+            webView.stopLoading()
+            webView.navigationDelegate = nil
+            activePDFNavigationDelegates.removeValue(forKey: renderID)
+            activePDFWebViews.removeValue(forKey: renderID)
+        }
+
+        try await navigationDelegate.load(html, in: webView, baseURL: baseURL)
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        // WKWebView.pdf(configuration:) captures a rectangle and clips a long
+        // document instead of invoking automatic print pagination. Use the
+        // same WebKit/AppKit print path as HtmlToPdf, but directly here: this
+        // avoids its dependency-backed WebViewPool lookup while retaining the
+        // configured page size, margins, pagination, selectable text, and
+        // original data-URI images.
+        let renderDirectory = try Self.createFlatPDFStagingDirectory()
+        defer {
+            do {
+                try Self.removeFlatPDFStagingDirectory(at: renderDirectory)
+            } catch {
+                log("⚠︎ Could not remove this PDF render's temporary files: \(error.localizedDescription)")
+            }
+        }
+        let renderedURL = renderDirectory.appendingPathComponent("rendered.pdf")
+        let printInfo = NSPrintInfo(dictionary: [
+            .jobDisposition: NSPrintInfo.JobDisposition.save,
+            .jobSavingURL: renderedURL,
+            .allPages: true,
+            .topMargin: margins.top,
+            .bottomMargin: margins.bottom,
+            .leftMargin: margins.left,
+            .rightMargin: margins.right,
+            .paperSize: pageSize,
+            .verticalPagination: NSNumber(value: NSPrintInfo.PaginationMode.automatic.rawValue)
+        ])
+        let operation = webView.printOperation(with: printInfo)
+        operation.showsPrintPanel = false
+        operation.showsProgressPanel = false
+        operation.canSpawnSeparateThread = true
+        log("Printing standalone PDF pages...")
+        let printDelegate = PDFPrintOperationDelegate()
+        try await printDelegate.run(operation, window: webView.window ?? NSWindow())
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        guard let document = PDFDocument(url: renderedURL), document.pageCount > 0 else {
+            throw ExportError.invalidGeneratedPDF
+        }
+        return try Data(contentsOf: renderedURL)
+    }
+
+    @MainActor
+    private func isPDFCancellationRequested() -> Bool {
+        shouldCancel
+    }
+
+    @MainActor
+    private func markPDFRenderTimedOutAndStop(_ renderID: UUID) {
+        timedOutPDFRenderIDs.insert(renderID)
+        // AppKit exposes no cancel method for a running NSPrintOperation. Stop
+        // navigation immediately; if printing has started, the structured
+        // render child remains joined until its print callback completes.
+        stopPDFRender(renderID)
+    }
+
+    @MainActor
+    private func stopPDFRender(_ renderID: UUID) {
+        activePDFNavigationDelegates[renderID]?.cancel()
+        activePDFWebViews[renderID]?.stopLoading()
+    }
+
+    /// Add explicit print-page geometry without changing the shared legacy HTML
+    /// wrapper used by HTML, CLI, or MCP exporters.
+    private func pdfHTMLWithPageGeometry(
+        _ html: String,
+        pageSize: CGSize
+    ) -> String {
+        func points(_ value: CGFloat) -> String { String(Double(value)) }
+        let pageStyle = """
+        <style id="ane-standalone-pdf-page">
+        @page { size: \(points(pageSize.width))pt \(points(pageSize.height))pt; }
+        </style>
+        """
+        if let headEnd = html.range(of: "</head>", options: .caseInsensitive) {
+            var output = html
+            output.insert(contentsOf: pageStyle, at: headEnd.lowerBound)
+            return output
+        }
+        if let bodyEnd = html.range(of: "</body>", options: .caseInsensitive) {
+            var output = html
+            output.insert(contentsOf: pageStyle, at: bodyEnd.lowerBound)
+            return output
+        }
+        return pageStyle + html
     }
 
     static func moveFlatPDFWithoutOverwriting(
@@ -842,23 +1128,20 @@ class ExportViewModel: ObservableObject {
             // For PDF, the concatenated content is HTML — render it
             let pdfConfig = configurations.pdf
             let pageSize = pdfConfig.pageSize.dimensions
-            let margins = pdfConfig.htmlConfiguration.toPDFEdgeInsets()
-            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
-                margins: margins,
-                paperSize: CGSize(width: pageSize.width, height: pageSize.height)
+            let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
+            let marginsNS = pdfConfig.htmlConfiguration.toNSEdgeInsets()
+            let paginatedHTML = pdfHTMLWithPageGeometry(
+                concatenated,
+                pageSize: pageSizeCG
             )
-
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await concatenated.print(to: fileURL, configuration: pdfConfiguration)
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(totalNotes) * 60_000_000_000)
-                    throw ExportError.pdfGenerationTimeout
-                }
-                try await group.next()
-                group.cancelAll()
-            }
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: fileURL,
+                pageSize: pageSizeCG,
+                margins: marginsNS,
+                baseURL: outputURL,
+                timeoutSeconds: UInt64(max(1, totalNotes)) * 60
+            )
         } else {
             try concatenated.write(to: fileURL, atomically: true, encoding: .utf8)
         }
@@ -1005,8 +1288,6 @@ class ExportViewModel: ObservableObject {
 
             // Apply page size and margin configuration
             let pageSize = pdfConfig.pageSize.dimensions
-            let margins = pdfConfig.htmlConfiguration.toPDFEdgeInsets()
-
             // Generate HTML with PDF-specific constraints
             let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
             let marginsNS = pdfConfig.htmlConfiguration.toNSEdgeInsets()
@@ -1020,29 +1301,17 @@ class ExportViewModel: ObservableObject {
                 pdfPageSize: pageSizeCG,
                 pdfMargins: marginsNS
             )
-            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
-                margins: margins,
-                paperSize: pageSizeCG
+            let paginatedHTML = pdfHTMLWithPageGeometry(
+                html,
+                pageSize: pageSizeCG
             )
-
-            // Add timeout for PDF generation to prevent infinite hangs on corrupted images
-            // Notes with many images can take 30+ seconds to render
-            // HEIC conversion to JPEG helps, but timeout still needed for truly corrupted files
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await html.print(to: fileURL, configuration: pdfConfiguration)
-                }
-
-                group.addTask {
-                    // 60 second timeout - allows image-heavy notes to render while catching infinite hangs
-                    try await Task.sleep(nanoseconds: 60_000_000_000)
-                    throw ExportError.pdfGenerationTimeout
-                }
-
-                // Wait for first task to complete (either PDF finishes or timeout)
-                try await group.next()
-                group.cancelAll()
-            }
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: fileURL,
+                pageSize: pageSizeCG,
+                margins: marginsNS,
+                baseURL: directory
+            )
 
             log("✓ Exported PDF: \(note.title)")
         } else if format.isBinaryFormat {

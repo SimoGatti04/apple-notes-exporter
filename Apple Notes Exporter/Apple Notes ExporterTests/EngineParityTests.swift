@@ -261,6 +261,51 @@ final class EngineParityTests: XCTestCase {
         XCTAssertNotNil(PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")))
     }
 
+    func test_standalonePDFPaginatesAtConfiguredSizeAndKeepsTextSelectable() async throws {
+        let db = try makeFixtureDatabase()
+        let output = try makeOutputDirectory()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        var configurations = ExportConfigurations.default
+        configurations.pdf.pageSize = .a5
+        configurations.pdf.htmlConfiguration.marginSize = 24
+        configurations.pdf.htmlConfiguration.marginUnit = .pt
+        viewModel.configurations = configurations
+
+        let body = (1...100).map { index in
+            "<p>Selectable pagination paragraph \(index) with enough words to occupy printable width.</p>"
+        }.joined()
+        let finalMarker = "Selectable page marker 100"
+        let note = makeNote(
+            htmlBody: "<html><body>\(body)<p>\(finalMarker)</p></body></html>"
+        )
+
+        await viewModel.exportSingleNotePDF(note, toDirectory: output)
+
+        guard case .completed = viewModel.exportState,
+              let pdf = PDFDocument(url: output.appendingPathComponent("Flat Note.pdf")),
+              let firstPage = pdf.page(at: 0) else {
+            return XCTFail("Expected a valid multi-page standalone PDF")
+        }
+        XCTAssertGreaterThan(pdf.pageCount, 1, "The whole document should paginate, not clip at the viewport")
+        let pageBounds = firstPage.bounds(for: .mediaBox)
+        XCTAssertEqual(pageBounds.width, 420, accuracy: 2)
+        XCTAssertEqual(pageBounds.height, 595, accuracy: 2)
+        let firstParagraphSelection = try XCTUnwrap(
+            pdf.findString("Selectable pagination paragraph 1", withOptions: []).first
+        )
+        let firstParagraphBounds = firstParagraphSelection.bounds(for: firstPage)
+        XCTAssertGreaterThanOrEqual(firstParagraphBounds.minX, 20, "Configured left margin should be honored")
+        XCTAssertGreaterThan(pageBounds.maxY - firstParagraphBounds.maxY, 20,
+                             "Configured top margin should be honored")
+        let selectableText = (0..<pdf.pageCount)
+            .compactMap { pdf.page(at: $0)?.string }
+            .joined(separator: " ")
+        XCTAssertTrue(selectableText.contains("Selectable pagination paragraph 1"))
+        XCTAssertTrue(selectableText.contains(finalMarker))
+    }
+
     func test_standalonePDFCollisionMovePreservesExistingFile() throws {
         let output = try makeOutputDirectory()
         let staging = output.deletingLastPathComponent()
@@ -453,7 +498,7 @@ final class EngineParityTests: XCTestCase {
         let db = try makeFixtureDatabase()
         let output = try makeOutputDirectory()
         let stagingBefore = flatPDFStagingPaths()
-        let longBody = String(repeating: "<p>Cancellation checkpoint</p>", count: 20_000)
+        let longBody = String(repeating: "<p>Cancellation checkpoint with enough text to paginate.</p>", count: 1_500)
         let viewModel = ExportViewModel(
             repository: DatabaseNotesRepository(databasePath: db), databasePath: db
         )
@@ -465,10 +510,10 @@ final class EngineParityTests: XCTestCase {
         }
 
         for _ in 0..<500 {
-            if viewModel.exportLog.contains(where: { $0.contains("Rendering standalone PDF") }) { break }
+            if viewModel.exportLog.contains(where: { $0.contains("Printing standalone PDF pages") }) { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("Rendering standalone PDF") })
+        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("Printing standalone PDF pages") })
         viewModel.shouldCancel = true
         exportTask.cancel()
         await exportTask.value
