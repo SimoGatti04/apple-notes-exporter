@@ -19,6 +19,7 @@
 //
 
 import XCTest
+import WebKit
 @testable import Apple_Notes_Exporter
 
 final class ExportSupportTests: XCTestCase {
@@ -1713,18 +1714,18 @@ import HtmlToPdf
 
 final class SimpleNavDelegate: NSObject, WKNavigationDelegate, @unchecked Sendable {
     private var continuation: CheckedContinuation<Void, Error>?
-    
+
     func waitForFinish() async throws {
         try await withCheckedThrowingContinuation { cont in
             self.continuation = cont
         }
     }
-    
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         continuation?.resume()
         continuation = nil
     }
-    
+
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         continuation?.resume(throwing: error)
         continuation = nil
@@ -2062,3 +2063,85 @@ extension ExportSupportTests {
     }
 }
 
+final class PDFHTMLSecurityTests: XCTestCase {
+    func testPDFHTMLEscapesUntrustedMetadataAndDeclaresStrictPolicy() {
+        var options = PDFDocumentOptions.a4Study
+        options.showHeader = true
+        let html = notePDFHTMLDocument(
+            title: "\"><script>alert(1)</script>",
+            created: "\"><script>created()</script>&",
+            modified: "\" onload=\"alert(2)",
+            options: options,
+            body: "<img src=\"https://example.invalid/pixel\" onerror=\"alert(3)\"><script>alert(4)</script>"
+        )
+
+        XCTAssertTrue(html.contains("content=\"&quot;&gt;&lt;script&gt;created()&lt;/script&gt;&amp;\""))
+        XCTAssertTrue(html.contains("content=\"&quot; onload=&quot;alert(2)\""))
+        XCTAssertTrue(html.contains("script-src 'none'"))
+        XCTAssertTrue(html.contains("img-src data:"))
+        XCTAssertTrue(html.contains("connect-src 'none'"))
+        XCTAssertTrue(html.contains("frame-src 'none'"))
+    }
+
+    @MainActor
+    func testPDFWebViewConfigurationDisablesScriptsAndBlocksExternalLoads() async throws {
+        let configuration = try await PDFWebViewIsolation.makeConfiguration()
+
+        XCTAssertFalse(configuration.defaultWebpagePreferences.allowsContentJavaScript)
+        XCTAssertFalse(configuration.preferences.javaScriptCanOpenWindowsAutomatically)
+        XCTAssertFalse(configuration.websiteDataStore.isPersistent)
+        XCTAssertTrue(PDFWebViewIsolation.externalResourceBlockingRuleJSON.contains("^https?://"))
+        XCTAssertTrue(PDFWebViewIsolation.externalResourceBlockingRuleJSON.contains("\"type\":\"block\""))
+    }
+}
+
+private final class PendingPDFPrintCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: ((Bool) -> Void)?
+
+    func store(_ completion: @escaping (Bool) -> Void) {
+        lock.lock()
+        self.completion = completion
+        lock.unlock()
+    }
+
+    func finish(_ success: Bool) {
+        lock.lock()
+        let completion = self.completion
+        self.completion = nil
+        lock.unlock()
+        completion?(success)
+    }
+}
+
+final class PDFPrintCancellationTests: XCTestCase {
+    func testCancellationWhilePrintIsPendingWaitsForCompletionCallback() async throws {
+        let delegate = PDFPrintOperationDelegate()
+        let pending = PendingPDFPrintCompletion()
+        let started = expectation(description: "print operation started")
+        let returned = expectation(description: "cancelled print waiter returned too early")
+        returned.isInverted = true
+
+        let task = Task {
+            try await delegate.run { completion in
+                pending.store(completion)
+                started.fulfill()
+            }
+            try Task.checkCancellation()
+            returned.fulfill()
+        }
+
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        await fulfillment(of: [returned], timeout: 0.1)
+
+        pending.finish(true)
+        do {
+            try await task.value
+            XCTFail("Expected cancellation after the pending print callback")
+        } catch is CancellationError {
+            // Expected: the AppKit-style completion gate returns only after
+            // the pending print is released, then the caller observes cancel.
+        }
+    }
+}

@@ -23,6 +23,12 @@ import SQLite3
 import OSLog
 import AppKit
 
+struct AttachmentMarkerFallbackResult {
+    let html: String
+    let incompleteAttachmentIDs: Set<String>
+    let diagnostics: [String]
+}
+
 /// Processes HTML to replace attachment placeholders with inline content or links
 class HTMLAttachmentProcessor {
     private let db: OpaquePointer
@@ -40,6 +46,67 @@ class HTMLAttachmentProcessor {
     init(database: OpaquePointer) {
         self.db = database
         self.tableParser = TableParser(database: database)
+    }
+
+    static func containsAttachmentMarkers(in html: String) -> Bool {
+        let pattern = #"<span\s+data-attachment-id="([^"]+)"\s+data-attachment-type="([^"]+)">.*?</span>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return false
+        }
+        return regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) != nil
+    }
+
+    /// Replace attachment markers without consulting the Notes database. This
+    /// is used only when the database cannot be opened; in particular, an
+    /// unvalidated ID is never used to fetch attachment bytes.
+    static func replaceUnavailableMarkersWithoutDatabase(
+        in html: String,
+        attachments: [NotesAttachment],
+        reason: String
+    ) -> AttachmentMarkerFallbackResult {
+        let pattern = #"<span\s+data-attachment-id="([^"]+)"\s+data-attachment-type="([^"]+)">.*?</span>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return AttachmentMarkerFallbackResult(html: html, incompleteAttachmentIDs: [], diagnostics: [])
+        }
+        let source = html as NSString
+        let matches = regex.matches(in: html, range: NSRange(location: 0, length: source.length))
+        var attachmentMap: [String: NotesAttachment] = [:]
+        for attachment in attachments where attachmentMap[attachment.id] == nil {
+            // Preserve the first occurrence deterministically. Partially
+            // decoded or damaged stores may contain duplicate identifiers.
+            attachmentMap[attachment.id] = attachment
+        }
+        var result = html
+        var incompleteIDs = Set<String>()
+        var diagnostics: [String] = []
+
+        for match in matches.reversed() where match.numberOfRanges >= 3 {
+            let fullRange = match.range(at: 0)
+            let identifier = source.substring(with: match.range(at: 1))
+            let typeUTI = source.substring(with: match.range(at: 2))
+            let attachment = attachmentMap[identifier]
+            let label = attachment?.filename ?? attachment?.name ?? "Attachment \(identifier)"
+            let isUnverified = attachment == nil
+            let detail = isUnverified
+                ? "Ownership could not be verified; original content was not accessed"
+                : "The source database was unavailable; original content was not accessed"
+            let reference = standaloneFileReferenceHTML(
+                filename: label,
+                description: detail
+            )
+            result = (result as NSString).replacingCharacters(in: fullRange, with: reference)
+
+            if incompleteIDs.insert(identifier).inserted {
+                let safetyNote = isUnverified ? " No attachment bytes were read." : ""
+                diagnostics.append("Attachment '\(label)' (\(typeUTI)) is incomplete in the standalone PDF: \(reason).\(safetyNote)")
+            }
+        }
+
+        return AttachmentMarkerFallbackResult(
+            html: result,
+            incompleteAttachmentIDs: incompleteIDs,
+            diagnostics: diagnostics
+        )
     }
 
     static func isInlineImageType(_ typeUTI: String) -> Bool {
@@ -142,21 +209,34 @@ class HTMLAttachmentProcessor {
             let uuid = nsString.substring(with: uuidRange)
             let typeUti = nsString.substring(with: typeRange)
 
-            // Create a NotesAttachment if we don't have one in the map
-            let attachment = attachmentMap[uuid] ?? NotesAttachment(
-                id: uuid,
-                typeUTI: typeUti,
-                filename: nil
-            )
-
-            let replacement = generateReplacementHTML(
-                for: attachment,
-                uuid: uuid,
-                relativePath: attachmentPaths[uuid],
-                embedImages: embedImages,
-                linkEmbeddedImages: linkEmbeddedImages,
-                standalonePDF: standalonePDF
-            )
+            let replacement: String
+            if let attachment = attachmentMap[uuid] {
+                replacement = generateReplacementHTML(
+                    for: attachment,
+                    uuid: uuid,
+                    relativePath: attachmentPaths[uuid],
+                    embedImages: embedImages,
+                    linkEmbeddedImages: linkEmbeddedImages,
+                    standalonePDF: standalonePDF
+                )
+            } else if standalonePDF {
+                let unverified = NotesAttachment(id: uuid, typeUTI: typeUti, filename: nil)
+                markIncomplete(unverified, reason: "ownership validation did not include this attachment; original content was not accessed")
+                replacement = Self.standaloneFileReferenceHTML(
+                    filename: "Unverified attachment \(uuid)",
+                    description: "Ownership could not be verified; original content was not accessed"
+                )
+            } else {
+                let attachment = NotesAttachment(id: uuid, typeUTI: typeUti, filename: nil)
+                replacement = generateReplacementHTML(
+                    for: attachment,
+                    uuid: uuid,
+                    relativePath: attachmentPaths[uuid],
+                    embedImages: embedImages,
+                    linkEmbeddedImages: linkEmbeddedImages,
+                    standalonePDF: false
+                )
+            }
 
             result = (result as NSString).replacingCharacters(in: fullRange, with: replacement)
         }
@@ -179,7 +259,7 @@ class HTMLAttachmentProcessor {
         // only the first staged child as if it represented the whole gallery.
         if standalonePDF && attachment.typeUTI == "com.apple.notes.gallery" {
             markIncomplete(attachment, reason: "the gallery’s original images are not all rendered in the standalone PDF")
-            return generateStandaloneFileReferenceHTML(
+            return Self.standaloneFileReferenceHTML(
                 filename: attachment.filename ?? "Image gallery",
                 description: "Original gallery images not fully rendered or embedded"
             )
@@ -216,7 +296,7 @@ class HTMLAttachmentProcessor {
         if attachment.typeUTI == "com.adobe.pdf" || attachment.typeUTI == "public.pdf" {
             if standalonePDF {
                 markIncomplete(attachment, reason: "the original PDF file is not embedded")
-                return generateStandaloneFileReferenceHTML(
+                return Self.standaloneFileReferenceHTML(
                     filename: attachment.filename ?? "PDF document",
                     description: "Original PDF file not embedded in this PDF"
                 )
@@ -226,7 +306,7 @@ class HTMLAttachmentProcessor {
 
         if standalonePDF {
             markIncomplete(attachment, reason: "the original file is not embedded")
-            return generateStandaloneFileReferenceHTML(
+            return Self.standaloneFileReferenceHTML(
                 filename: attachment.filename ?? attachment.name,
                 description: "Original file not embedded in this PDF (\(getTypeDescription(for: attachment.typeUTI)))"
             )
@@ -392,7 +472,7 @@ class HTMLAttachmentProcessor {
         """
     }
 
-    private func generateStandaloneFileReferenceHTML(filename: String, description: String) -> String {
+    private static func standaloneFileReferenceHTML(filename: String, description: String) -> String {
         """
         <div style="border: 1px solid #d8d8d8; border-radius: 6px; padding: 10px; margin: 8px 0; color: #333;">
             <strong>📎 \(filename.htmlEscaped)</strong>

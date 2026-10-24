@@ -1381,6 +1381,10 @@ public func extractHTMLBodyContent(_ html: String) -> String {
 
 /// Generates a complete, standalone HTML document styled for high-quality PDF rendering
 /// using the specified profile and options.
+enum PDFDocumentSecurityPolicy {
+    static let contentSecurityPolicy = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; media-src data:; script-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+}
+
 public func notePDFHTMLDocument(
     title: String,
     created: String = "",
@@ -1412,8 +1416,9 @@ public func notePDFHTMLDocument(
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta name="created" content="\(created)">
-        <meta name="modified" content="\(modified)">
+        <meta http-equiv="Content-Security-Policy" content="\(PDFDocumentSecurityPolicy.contentSecurityPolicy)">
+        <meta name="created" content="\(created.htmlEscaped)">
+        <meta name="modified" content="\(modified.htmlEscaped)">
         <meta name="ane-profile" content="\(options.profile.rawValue)">
         <title>\(title.htmlEscaped)</title>
         <style>

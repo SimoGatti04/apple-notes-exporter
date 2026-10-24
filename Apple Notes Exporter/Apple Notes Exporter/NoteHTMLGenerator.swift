@@ -137,6 +137,8 @@ class NoteHTMLGenerator {
         var listStack: [(type: Int32, indentLevel: Int32)] = []
         var currentListItemHTML = ""
         var inListItem = false
+        var activeBlockSignature: String?
+        var activeBlockCloseTag = ""
 
         for (_, run) in condensedRuns.enumerated() {
             let length = Int(run.length)
@@ -226,6 +228,12 @@ class NoteHTMLGenerator {
 
             // Handle list items
             if isListItem {
+                if activeBlockSignature != nil {
+                    html += activeBlockCloseTag
+                    activeBlockSignature = nil
+                    activeBlockCloseTag = ""
+                }
+
                 // segment is raw plaintext from the note; escape it unless we're
                 // about to replace it with attachment HTML below.
                 var styledText = run.hasAttachmentInfo ? segment : segment.htmlEscaped
@@ -266,6 +274,9 @@ class NoteHTMLGenerator {
 
                 // Non-list content
                 let tags = formattingTags(for: run)
+                let blockTags = run.hasParagraphStyle
+                    ? paragraphBlockTags(for: run)
+                    : (open: activeBlockSignature ?? "", close: activeBlockCloseTag)
 
                 let renderedSegment: String
                 if run.hasAttachmentInfo {
@@ -274,7 +285,32 @@ class NoteHTMLGenerator {
                     renderedSegment = segment.htmlEscaped
                 }
 
-                html += tags.open + renderedSegment.replacingOccurrences(of: "\n", with: "<br>") + tags.close
+                let parts = renderedSegment.components(separatedBy: "\n")
+                for (partIndex, part) in parts.enumerated() {
+                    if partIndex > 0 {
+                        if activeBlockSignature != nil {
+                            html += activeBlockCloseTag
+                            activeBlockSignature = nil
+                            activeBlockCloseTag = ""
+                        }
+                        html += "<br>"
+                    }
+
+                    if !part.isEmpty {
+                        let desiredSignature = blockTags.open.isEmpty ? nil : blockTags.open
+                        if activeBlockSignature != desiredSignature {
+                            if activeBlockSignature != nil {
+                                html += activeBlockCloseTag
+                            }
+                            activeBlockSignature = desiredSignature
+                            activeBlockCloseTag = desiredSignature == nil ? "" : blockTags.close
+                            if desiredSignature != nil {
+                                html += blockTags.open
+                            }
+                        }
+                        html += tags.open + part + tags.close
+                    }
+                }
             }
 
             currentPos = endPos
@@ -284,6 +320,9 @@ class NoteHTMLGenerator {
         if inListItem {
             let hasContent = currentListItemHTML.trimmingCharacters(in: .whitespacesAndNewlines).count > 2
             if hasContent { html += "<li>" + currentListItemHTML + "</li>" }
+        }
+        if activeBlockSignature != nil {
+            html += activeBlockCloseTag
         }
         while !listStack.isEmpty {
             let closed = listStack.removeLast()
@@ -323,17 +362,40 @@ class NoteHTMLGenerator {
         return "<span data-attachment-id=\"\(safeId)\" data-attachment-type=\"\(safeUti)\">[File: \(safeUti)]</span>"
     }
 
-    /// Sanitize a link href to block XSS via javascript:/data:/vbscript: URIs.
-    /// Allows http(s), mailto, tel, ftp, sms, and Apple Notes internal links;
-    /// everything else is replaced with "#". Also HTML-escapes the allowed URL.
-    private func sanitizeLinkHref(_ link: String) -> String {
-        let trimmed = link.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = trimmed.lowercased()
-        let allowedSchemes = ["http://", "https://", "mailto:", "applenotes:", "tel:", "sms:", "ftp://"]
-        if allowedSchemes.contains(where: { lower.hasPrefix($0) }) {
-            return trimmed.htmlEscaped
+    /// Convert protobuf inline-attachment metadata to safe HTML. The database
+    /// values are plain text; escape them only at this HTML boundary.
+    static func inlineAttachmentHTML(typeUti: String, altText: String, token: String?) -> String {
+        let safeAltText = altText.htmlEscaped
+        guard let token else { return safeAltText }
+
+        if typeUti == "com.apple.notes.inlinetextattachment.link" {
+            return "<a href=\"\(sanitizeLinkHref(token))\">\(safeAltText)</a>"
         }
-        return "#"
+        if typeUti == "com.apple.notes.inlinetextattachment.mention" {
+            return "\(safeAltText) [\(token.htmlEscaped)]"
+        }
+        return safeAltText
+    }
+
+    /// Allow only explicitly supported URL schemes and reject malformed
+    /// authorities and control characters before escaping the HTML attribute.
+    private static func sanitizeLinkHref(_ link: String) -> String {
+        let trimmed = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https", "mailto", "applenotes", "tel", "sms", "ftp"].contains(scheme)
+        else {
+            return "#"
+        }
+
+        switch scheme {
+        case "http", "https", "ftp":
+            guard let host = components.host, !host.isEmpty else { return "#" }
+        default:
+            guard !components.path.isEmpty else { return "#" }
+        }
+        return trimmed.htmlEscaped
     }
 
     /// Query inline attachment text using the C parser API
@@ -349,58 +411,50 @@ class NoteHTMLGenerator {
 
         if let tokenPtr = att.pointee.token_identifier {
             let token = String(cString: tokenPtr)
-
-            // A link to another note becomes a real anchor, so that
-            // rewriteInternalLinks can retarget the href at the exported file
-            // and the result is actually clickable. Emitted as plain text it
-            // was only ever a bare applenotes: URL sitting in the output.
-            if typeUti == "com.apple.notes.inlinetextattachment.link" {
-                return "<a href=\"\(token.htmlEscaped)\">\(altText.htmlEscaped)</a>"
-            }
-
-            // Mentions point at people, not notes, so there is nothing to link
-            // to. Keep the token visible rather than dropping information.
-            if typeUti == "com.apple.notes.inlinetextattachment.mention" {
-                return "\(altText) [\(token)]"
-            }
+            return Self.inlineAttachmentHTML(typeUti: typeUti, altText: altText, token: token)
         }
 
-        return altText
+        return Self.inlineAttachmentHTML(typeUti: typeUti, altText: altText, token: nil)
     }
 
     // MARK: - Helpers
 
-    /// Build balanced semantic wrappers for the styles carried by a run.
-    /// Unknown numeric values are not mapped to invented visual meanings.
-    private func formattingTags(for run: AttributeRun) -> (open: String, close: String) {
+    /// Build block-level wrappers independently from inline formatting. The
+    /// caller keeps the returned block open across adjacent style runs.
+    private func paragraphBlockTags(for run: AttributeRun) -> (open: String, close: String) {
+        guard run.hasParagraphStyle else { return ("", "") }
+        let style = run.paragraphStyle
+        let alignment = alignmentDeclaration(for: style)
         var wrappers: [(open: String, close: String)] = []
 
-        if run.hasParagraphStyle {
-            let style = run.paragraphStyle
-            let alignment = alignmentDeclaration(for: style)
+        if style.hasBlockQuote && style.blockQuote != 0 {
+            var declarations = ["margin: 4px 0", "padding-left: 12px", "border-left: 3px solid #ccc"]
+            if let alignment { declarations.append(alignment) }
+            wrappers.append(("<blockquote class=\"ane-blockquote\"\(styleAttribute(declarations))>", "</blockquote>"))
+        }
 
-            if style.hasBlockQuote && style.blockQuote != 0 {
-                var declarations = ["margin: 4px 0", "padding-left: 12px", "border-left: 3px solid #ccc"]
-                if let alignment { declarations.append(alignment) }
-                wrappers.append(("<blockquote class=\"ane-blockquote\"\(styleAttribute(declarations))>", "</blockquote>"))
-            }
-
-            switch style.styleType {
-            case 0: wrappers.append((styledElementOpenTag("h1", alignment: alignment), "</h1>"))
-            case 1: wrappers.append((styledElementOpenTag("h2", alignment: alignment), "</h2>"))
-            case 2: wrappers.append((styledElementOpenTag("h3", alignment: alignment), "</h3>"))
-            case 4:
-                let declarations = [
-                    "white-space: pre-wrap", "font-family: monospace", "background: #f5f5f5",
-                    "padding: 8px", "border-radius: 4px", "margin: 4px 0"
-                ] + (alignment.map { [$0] } ?? [])
-                wrappers.append(("<pre class=\"ane-monostyle\"\(styleAttribute(declarations))>", "</pre>"))
-            default:
-                if let alignment {
-                    wrappers.append(("<div class=\"ane-aligned-paragraph\"\(styleAttribute([alignment]))>", "</div>"))
-                }
+        switch style.styleType {
+        case 0: wrappers.append((styledElementOpenTag("h1", alignment: alignment), "</h1>"))
+        case 1: wrappers.append((styledElementOpenTag("h2", alignment: alignment), "</h2>"))
+        case 2: wrappers.append((styledElementOpenTag("h3", alignment: alignment), "</h3>"))
+        case 4:
+            let declarations = [
+                "white-space: pre-wrap", "font-family: monospace", "background: #f5f5f5",
+                "padding: 8px", "border-radius: 4px", "margin: 4px 0"
+            ] + (alignment.map { [$0] } ?? [])
+            wrappers.append(("<pre class=\"ane-monostyle\"\(styleAttribute(declarations))>", "</pre>"))
+        default:
+            if let alignment {
+                wrappers.append(("<div class=\"ane-aligned-paragraph\"\(styleAttribute([alignment]))>", "</div>"))
             }
         }
+
+        return (wrappers.map(\.open).joined(), wrappers.reversed().map(\.close).joined())
+    }
+
+    /// Build balanced inline wrappers for the styles carried by an attribute run.
+    private func formattingTags(for run: AttributeRun) -> (open: String, close: String) {
+        var wrappers: [(open: String, close: String)] = []
 
         if run.hasFont {
             var declarations: [String] = []
@@ -424,7 +478,6 @@ class NoteHTMLGenerator {
             if let name = highlightNames[run.emphasisStyle] {
                 wrappers.append(("<mark class=\"ane-highlight ane-highlight-\(name)\">", "</mark>"))
             } else {
-                // Keep an unrecognized value inspectable without asserting what it means.
                 wrappers.append(("<span data-ane-emphasis-style=\"\(run.emphasisStyle)\">", "</span>"))
             }
         }
@@ -435,12 +488,9 @@ class NoteHTMLGenerator {
         if run.fontWeight == 2 || run.fontWeight == 3 { wrappers.append(("<i>", "</i>")) }
         if run.underlined != 0 { wrappers.append(("<u>", "</u>")) }
         if run.strikethrough != 0 { wrappers.append(("<s>", "</s>")) }
-        if !run.link.isEmpty { wrappers.append(("<a href=\"\(sanitizeLinkHref(run.link))\">", "</a>")) }
+        if !run.link.isEmpty { wrappers.append(("<a href=\"\(Self.sanitizeLinkHref(run.link))\">", "</a>")) }
 
-        return (
-            wrappers.map(\.open).joined(),
-            wrappers.reversed().map(\.close).joined()
-        )
+        return (wrappers.map(\.open).joined(), wrappers.reversed().map(\.close).joined())
     }
 
     private func styledElementOpenTag(_ tag: String, alignment: String?) -> String {

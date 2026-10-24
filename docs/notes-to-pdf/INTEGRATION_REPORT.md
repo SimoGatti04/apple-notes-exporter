@@ -150,3 +150,56 @@ Task-related resources currently retained under `/private/tmp` for evidence/repr
 - `/private/tmp/apple-notes-exporter-profile-visuals` — four synthetic TIFF page captures and `manifest.json`, visually inspected for this report.
 
 These contain synthetic test/build outputs only, not source-note data. They are retained temporarily so the user can inspect the evidence. They can be removed after review; the source branches/worktrees are not cleanup targets in this P2 handoff and were left intact.
+
+## 10. P2.1 corrective checkpoint — 2026-10-24
+
+**Checkpoint base:** `2b01d0f2c870939d2bcd86f2f3ba1fc23cb2c6e2` on `codex/notes-pdf-integration`.
+**Worktree:** `/Users/gatti/.codex/worktrees/notes-pdf-integration/apple-notes-exporter`.
+**Scope:** correction and regression coverage for findings F1–F5; no push, merge, rebase, reset, or source-worktree cleanup was performed.
+
+### Initial dirty files and provenance
+
+At the first authorized inspection of this checkpoint, these four files were already modified and unstaged in the integration worktree:
+
+- `Apple Notes Exporter/Apple Notes Exporter/NoteHTMLGenerator.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/Apple_Notes_ExporterTests.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/HTMLAttachmentProcessor.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
+
+Because those edits were uncommitted on arrival, Git provides no author or source-branch provenance for them. They are attributed only to the pre-existing dirty state of this integration worktree; no attribution is made to the agent whose separate worktree-access attempt was rejected. That rejected attempt made no changes. The four source worktrees were not modified.
+
+The corrective checkpoint also changes `ExportSupport.swift` and `ViewModels/ExportViewModel.swift` and updates this report. The complete resulting file list is in §11.
+
+### Findings and corrections
+
+- **F1 — PDF HTML/WebKit isolation: addressed.** Untrusted title/date metadata is HTML-escaped, the standalone document declares a restrictive CSP, and the renderer uses a fresh non-persistent WebKit data store with content JavaScript disabled. An HTTP(S) content rule blocks external loads, and the navigation delegate permits only the initial local/about main-frame document. Synthetic security tests verified the generated policy, escaped metadata, and configuration; no live malicious network endpoint test was run.
+- **F2 — block formatting split across attributed runs: addressed.** The renderer now keeps a logical paragraph/block open across adjacent inline runs and closes it at structural boundaries. Regression coverage exercises heading, Monostile, and blockquote content split across styled runs, including emoji and newline boundaries.
+- **F3 — orphan attachment markers in standalone PDF: addressed.** The actual `ExportViewModel` PDF path now processes HTML markers even when the note's attachment array is empty. When the Notes database or its attachment handle is unavailable, markers become escaped, explicit non-embedded references and incomplete-attachment diagnostics are recorded; unverified IDs are never used to fetch bytes. The active dictionary-building paths were checked: they use assignment loops rather than a trapping unique-key initializer; the unavailable-database fallback now selects the first duplicate ID deterministically, covered by regression.
+- **F4 — cancellation while AppKit printing is pending: addressed for the pending-completion case.** A deterministic completion gate keeps the cancelled task suspended until the outstanding print completion callback arrives, after which cancellation is observed. The synthetic pending-callback regression passed. A separate timeout-specific regression remains an existing follow-up and is not claimed here.
+- **F5 — diff hygiene: addressed.** Trailing whitespace was removed; `git diff --check` passes.
+
+Additional verified issue: the initial test diff contained unescaped Swift string literals; the current test source parses and compiles, and its hostile-markup inputs are synthetic. No personal Notes data was used.
+
+### P2.1 validation on 2026-10-24
+
+The deployment target in project files was not changed. Xcode was invoked with the diagnostic build setting `MACOSX_DEPLOYMENT_TARGET=13.0` and code signing disabled for this local validation.
+
+| Check | Outcome | Evidence |
+|---|---|---|
+| Complete app/CLI/MCP build action | **PASS** | `/private/tmp/apple-notes-p21-build.log` — `BUILD SUCCEEDED`; pre-existing warnings include unnecessary `await`, deprecated MCP API, and Combine visibility diagnostics. |
+| Complete app/unit test target | **PASS** — 189 passed, 0 failed, 0 skipped | `/private/tmp/apple-notes-p21-full-test.log`; the test target ended with “All tests passed.” |
+| P2.1 targeted regressions within that target | **PASS** — hostile HTML/metadata and link-scheme rejection; fragmented block formatting; orphan-marker view-model fallback; duplicate attachment IDs; PDF security configuration; pending-print cancellation | Same test log: `NoteHTMLGeneratorFormattingTests`, `HTMLAttachmentFallbackTests` (2), `PDFHTMLSecurityTests` (2), and `PDFPrintCancellationTests` (1). |
+| Full scheme including UI tests | **PARTIAL / UI RUNNER ERROR** — all 189 app/unit tests passed, then `Apple Notes ExporterUITests-Runner` hung before establishing its test connection; `xcodebuild test` exited 65 | `/private/tmp/apple-notes-p21-full.xcresult` and the final failure lines in `/private/tmp/apple-notes-p21-full-test.log`. No UI test behavior is claimed. |
+| Whitespace and conflict-marker check | **PASS** | `git diff --check`; final Git inventory to be reported with the checkpoint handoff. |
+
+The UI-runner failure matches the environment limitation already recorded in §6–7. It does not negate the successful app/unit test target, but the full scheme is not green and UI acceptance remains open.
+
+## 11. P2.1 changed files
+
+- `Apple Notes Exporter/Apple Notes Exporter/ExportSupport.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/HTMLAttachmentProcessor.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/NoteHTMLGenerator.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ViewModels/ExportViewModel.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/Apple_Notes_ExporterTests.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
+- `docs/notes-to-pdf/INTEGRATION_REPORT.md`

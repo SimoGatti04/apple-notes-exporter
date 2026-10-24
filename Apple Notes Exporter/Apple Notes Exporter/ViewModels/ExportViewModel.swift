@@ -94,6 +94,7 @@ enum ExportState: Equatable {
 @MainActor
 private final class PDFNavigationDelegate: NSObject, WKNavigationDelegate {
     private var continuation: CheckedContinuation<Void, Error>?
+    private var initialDocumentNavigationAllowed = false
 
     func load(_ html: String, in webView: WKWebView, baseURL: URL?) async throws {
         try await withCheckedThrowingContinuation { continuation in
@@ -117,6 +118,21 @@ private final class PDFNavigationDelegate: NSObject, WKNavigationDelegate {
         finish(.failure(error))
     }
 
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        let scheme = navigationAction.request.url?.scheme?.lowercased()
+        let isInitialLocalDocument = !initialDocumentNavigationAllowed
+            && navigationAction.targetFrame?.isMainFrame == true
+            && (scheme == "about" || scheme == "file")
+        if isInitialLocalDocument {
+            initialDocumentNavigationAllowed = true
+        }
+        decisionHandler(isInitialLocalDocument ? .allow : .cancel)
+    }
+
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         finish(.failure(ExportError.pdfNavigationFailed("The WebKit content process terminated.")))
     }
@@ -132,23 +148,73 @@ private final class PDFNavigationDelegate: NSObject, WKNavigationDelegate {
     }
 }
 
-private final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
+/// A fresh, ephemeral WebKit configuration for untrusted note HTML. Active
+/// content is disabled, and the rule list blocks HTTP(S) loads even if a note
+/// contains resource tags outside the expected parser output.
+@MainActor
+enum PDFWebViewIsolation {
+    static let externalResourceBlockingRuleJSON = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}}]"#
+
+    static func makeConfiguration() async throws -> WKWebViewConfiguration {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        let ruleList = try await compileExternalResourceBlockingRule()
+        configuration.userContentController.add(ruleList)
+        return configuration
+    }
+
+    private static func compileExternalResourceBlockingRule() async throws -> WKContentRuleList {
+        try await withCheckedThrowingContinuation { continuation in
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "AppleNotesExporterPDFNoHTTP-v1",
+                encodedContentRuleList: externalResourceBlockingRuleJSON
+            ) { ruleList, error in
+                if let ruleList {
+                    continuation.resume(returning: ruleList)
+                } else if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(throwing: ExportError.pdfNavigationFailed(
+                        "WebKit did not create the PDF resource policy."
+                    ))
+                }
+            }
+        }
+    }
+}
+
+final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
 
     @MainActor
     func run(_ operation: NSPrintOperation, window: NSWindow) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            self.continuation = continuation
-            lock.unlock()
-
+        try await run { _ in
             operation.runModal(
                 for: window,
                 delegate: self,
                 didRun: #selector(printOperationDidRun(_:success:contextInfo:)),
                 contextInfo: nil
             )
+        }
+    }
+
+    /// Shared completion gate. The injected starter is a deterministic test
+    /// seam for the interval between AppKit starting a print and invoking its
+    /// completion callback. Cancellation does not resume this continuation:
+    /// callers remain joined until AppKit confirms printing has stopped.
+    func run(_ startOperation: (@escaping (Bool) -> Void) -> Void) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+
+            startOperation { [weak self] success in
+                self?.finish(success: success)
+            }
         }
     }
 
@@ -160,6 +226,10 @@ private final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
         // NSPrintOperation may call its delegate on the worker thread when
         // canSpawnSeparateThread is enabled. Resume the continuation without
         // touching actor-isolated or unsynchronized state from that callback.
+        finish(success: success)
+    }
+
+    private func finish(success: Bool) {
         lock.lock()
         let continuation = self.continuation
         self.continuation = nil
@@ -810,7 +880,11 @@ class ExportViewModel: ObservableObject {
         try Task.checkCancellation()
         if shouldCancel { throw CancellationError() }
 
-        let webView = WKWebView(frame: CGRect(origin: .zero, size: pageSize))
+        let webViewConfiguration = try await PDFWebViewIsolation.makeConfiguration()
+        let webView = WKWebView(
+            frame: CGRect(origin: .zero, size: pageSize),
+            configuration: webViewConfiguration
+        )
         let navigationDelegate = PDFNavigationDelegate()
         activePDFWebViews[renderID] = webView
         activePDFNavigationDelegates[renderID] = navigationDelegate
@@ -1497,7 +1571,7 @@ class ExportViewModel: ObservableObject {
 
     // MARK: - Content Generation
 
-    private func generateHTML(
+    func generateHTML(
         for note: NotesNote,
         config: HTMLConfiguration? = nil,
         forPDF: Bool = false,
@@ -1555,7 +1629,9 @@ class ExportViewModel: ObservableObject {
         // A standalone PDF additionally records any attachment that cannot be
         // represented by bytes inside the PDF; temporary sibling links are not
         // a valid fallback for a single-file deliverable.
-        if !note.attachments.isEmpty {
+        let hasStandalonePDFMarkers = standalonePDF
+            && HTMLAttachmentProcessor.containsAttachmentMarkers(in: linkRewrittenBody)
+        if !note.attachments.isEmpty || hasStandalonePDFMarkers {
             if let parserHandle = ane_open(databasePath) {
                 defer { ane_close(parserHandle) }
                 if let rawHandle = ane_get_sqlite_handle(parserHandle) {
@@ -1580,14 +1656,16 @@ class ExportViewModel: ObservableObject {
                         }
                     }
                 } else if standalonePDF {
-                    recordFlatPDFAttachmentFailure(
-                        note.attachments,
+                    processedHTML = replaceUnavailablePDFAttachmentMarkers(
+                        in: linkRewrittenBody,
+                        attachments: note.attachments,
                         reason: "The Notes database attachment handle was unavailable"
                     )
                 }
             } else if standalonePDF {
-                recordFlatPDFAttachmentFailure(
-                    note.attachments,
+                processedHTML = replaceUnavailablePDFAttachmentMarkers(
+                    in: linkRewrittenBody,
+                    attachments: note.attachments,
                     reason: "The Notes database could not be opened to verify attachment data"
                 )
             }
@@ -1646,6 +1724,30 @@ class ExportViewModel: ObservableObject {
             let label = attachment.filename ?? attachment.id
             log("⚠︎ Attachment '\(label)' was not verified for the PDF: \(reason).")
         }
+    }
+
+    private func replaceUnavailablePDFAttachmentMarkers(
+        in html: String,
+        attachments: [NotesAttachment],
+        reason: String
+    ) -> String {
+        let fallback = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: html,
+            attachments: attachments,
+            reason: reason
+        )
+        flatPDFIncompleteAttachmentIDs.formUnion(fallback.incompleteAttachmentIDs)
+        for diagnostic in fallback.diagnostics {
+            log("⚠︎ \(diagnostic)")
+        }
+
+        // Preserve reporting for attachments without inline markers while
+        // avoiding duplicate warnings for markers replaced by the fallback.
+        let unrepresentedAttachments = attachments.filter {
+            !fallback.incompleteAttachmentIDs.contains($0.id)
+        }
+        recordFlatPDFAttachmentFailure(unrepresentedAttachments, reason: reason)
+        return fallback.html
     }
 
     // MARK: - Helper Methods

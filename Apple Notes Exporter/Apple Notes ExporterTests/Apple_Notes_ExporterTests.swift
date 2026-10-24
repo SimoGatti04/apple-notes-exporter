@@ -295,6 +295,86 @@ final class NoteHTMLGeneratorFormattingTests: XCTestCase {
         XCTAssertEqual(plaintext(from: html), text)
     }
 
+    func test_inlineAttachmentMetadataIsEscapedAndUnsafeLinkSchemesAreRejected() {
+        let mention = NoteHTMLGenerator.inlineAttachmentHTML(
+            typeUti: "com.apple.notes.inlinetextattachment.mention",
+            altText: "<img src=x onerror=alert(1)> & colleague",
+            token: "</span><script>alert(2)</script>"
+        )
+        XCTAssertEqual(
+            mention,
+            "&lt;img src=x onerror=alert(1)&gt; &amp; colleague [&lt;/span&gt;&lt;script&gt;alert(2)&lt;/script&gt;]"
+        )
+        XCTAssertFalse(mention.contains("<script"))
+        XCTAssertFalse(mention.contains("<img"))
+
+        let unsafeLink = NoteHTMLGenerator.inlineAttachmentHTML(
+            typeUti: "com.apple.notes.inlinetextattachment.link",
+            altText: "<script>unsafe label</script>",
+            token: "javascript:alert(1)"
+        )
+        XCTAssertEqual(unsafeLink, "<a href=\"#\">&lt;script&gt;unsafe label&lt;/script&gt;</a>")
+
+        let safeLink = NoteHTMLGenerator.inlineAttachmentHTML(
+            typeUti: "com.apple.notes.inlinetextattachment.link",
+            altText: "A & B",
+            token: "https://example.test/guide?a=1&b=2"
+        )
+        XCTAssertEqual(safeLink, "<a href=\"https://example.test/guide?a=1&amp;b=2\">A &amp; B</a>")
+        XCTAssertFalse(safeLink.contains("&amp;amp;"))
+    }
+
+    func test_inlineStyleRunsShareTheirOriginalHeadingMonostyleAndBlockQuoteBlocks() {
+        let text = "Head🚀\nNext\nCode🚀\nQuote🚀"
+
+        var headingFirst = run("Head")
+        headingFirst.paragraphStyle = ParagraphStyle()
+        headingFirst.paragraphStyle.styleType = 0
+        var headingSecond = run("🚀")
+        headingSecond.paragraphStyle = headingFirst.paragraphStyle
+        headingSecond.fontWeight = 1
+        let firstLineBreak = run("\n")
+
+        var secondHeading = run("Next")
+        secondHeading.paragraphStyle = ParagraphStyle()
+        secondHeading.paragraphStyle.styleType = 0
+        let secondLineBreak = run("\n")
+
+        var codeFirst = run("Code")
+        codeFirst.paragraphStyle = ParagraphStyle()
+        codeFirst.paragraphStyle.styleType = 4
+        var codeSecond = run("🚀")
+        codeSecond.paragraphStyle = codeFirst.paragraphStyle
+        codeSecond.emphasisStyle = 1
+        let thirdLineBreak = run("\n")
+
+        var quoteFirst = run("Quote")
+        quoteFirst.paragraphStyle = ParagraphStyle()
+        quoteFirst.paragraphStyle.styleType = 3
+        quoteFirst.paragraphStyle.blockQuote = 1
+        var quoteSecond = run("🚀")
+        quoteSecond.paragraphStyle = quoteFirst.paragraphStyle
+        quoteSecond.fontWeight = 2
+
+        let html = NoteHTMLGenerator(database: nil).generateHTML(from: note(
+            text,
+            runs: [headingFirst, headingSecond, firstLineBreak, secondHeading,
+                   secondLineBreak, codeFirst, codeSecond, thirdLineBreak,
+                   quoteFirst, quoteSecond]
+        ))
+
+        XCTAssertEqual(html.components(separatedBy: "<h1").count - 1, 2)
+        XCTAssertEqual(html.components(separatedBy: "</h1>").count - 1, 2)
+        XCTAssertEqual(html.components(separatedBy: "<pre class=\"ane-monostyle\"").count - 1, 1)
+        XCTAssertEqual(html.components(separatedBy: "</pre>").count - 1, 1)
+        XCTAssertEqual(html.components(separatedBy: "<blockquote class=\"ane-blockquote\"").count - 1, 1)
+        XCTAssertEqual(html.components(separatedBy: "</blockquote>").count - 1, 1)
+        XCTAssertTrue(html.contains("Head<b>🚀</b>"))
+        XCTAssertTrue(html.contains("Code<mark class=\"ane-highlight ane-highlight-purple\">🚀</mark>"))
+        XCTAssertTrue(html.contains("Quote<i>🚀</i>"))
+        XCTAssertEqual(plaintext(from: html), text)
+    }
+
     func test_styleChangeInsideParagraphFragmentKeepsBalancedInlineMarkup() {
         let text = "plain highlighted plain"
         let plainBefore = run("plain ")
@@ -313,6 +393,59 @@ final class NoteHTMLGeneratorFormattingTests: XCTestCase {
     }
 }
 
+
+final class HTMLAttachmentFallbackTests: XCTestCase {
+    func testUnavailableAttachmentFallbackHandlesDuplicateIDsWithoutTrapping() {
+        let marker = #"<span data-attachment-id="duplicate-id" data-attachment-type="public.pdf">&#xFFFC;</span>"#
+        let attachments = [
+            NotesAttachment(id: "duplicate-id", typeUTI: "public.pdf", filename: "first.pdf"),
+            NotesAttachment(id: "duplicate-id", typeUTI: "public.pdf", filename: "second.pdf")
+        ]
+
+        let result = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: marker,
+            attachments: attachments,
+            reason: "synthetic unavailable database"
+        )
+
+        XCTAssertEqual(result.incompleteAttachmentIDs, ["duplicate-id"])
+        XCTAssertFalse(result.html.contains("data-attachment-id"))
+        XCTAssertTrue(result.html.contains("first.pdf"))
+        XCTAssertFalse(result.html.contains("second.pdf"))
+        XCTAssertEqual(result.diagnostics.count, 1)
+    }
+
+    @MainActor
+    func testPDFExportViewModelReplacesOrphanMarkersWhenDatabaseIsUnavailable() async throws {
+        let marker = #"<span data-attachment-id="orphan-id" data-attachment-type="public.pdf">&#xFFFC;</span>"#
+        let note = NotesNote(
+            id: "synthetic-note",
+            title: "Synthetic attachment fallback",
+            plaintext: "Attachment",
+            htmlBody: "<p>Before</p>\(marker)<p>After</p>",
+            creationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_100),
+            folderId: "synthetic-folder",
+            accountId: "synthetic-account",
+            attachments: []
+        )
+        let unavailableDatabase = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-notes-db-\(UUID().uuidString)")
+            .appendingPathComponent("NoteStore.sqlite")
+        let viewModel = ExportViewModel(databasePath: unavailableDatabase.path)
+
+        let html = try await viewModel.generateHTML(
+            for: note,
+            config: .defaultConfiguration,
+            forPDF: true,
+            standalonePDF: true
+        )
+
+        XCTAssertFalse(html.contains("data-attachment-id"))
+        XCTAssertTrue(html.contains("Ownership could not be verified"))
+        XCTAssertTrue(viewModel.exportLog.contains { $0.contains("No attachment bytes were read") })
+    }
+}
 
 final class NotesSelectionStateTests: XCTestCase {
     private func account() -> NotesAccount {
