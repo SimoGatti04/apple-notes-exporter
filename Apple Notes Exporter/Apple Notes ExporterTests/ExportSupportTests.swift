@@ -72,6 +72,27 @@ final class ExportSupportTests: XCTestCase {
         XCTAssertEqual(legacy.pageSize, .a4)
     }
 
+    func test_folderOrganizationDefaultsFlatAndLegacyConfigurationDecodesFlat() throws {
+        XCTAssertEqual(ExportConfigurations.default.folderOrganization, .allTogether)
+
+        let current = try JSONEncoder().encode(ExportConfigurations.default)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: current) as? [String: Any])
+        object["folderOrganization"] = ExportFolderOrganization.asInNotes.rawValue
+        let selected = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ExportConfigurations.self, from: selected).folderOrganization,
+            .asInNotes
+        )
+
+        object.removeValue(forKey: "folderOrganization")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ExportConfigurations.self, from: legacy).folderOrganization,
+            .allTogether,
+            "Configurations saved before this preference must adopt the new flat default"
+        )
+    }
+
     // MARK: - HTML entity decoding
 
     func test_htmlDecoded_decodesNamedDecimalAndHexadecimalEntities() {
@@ -679,6 +700,128 @@ final class ExportSupportTests: XCTestCase {
             return XCTFail("expected a path mapping for the note")
         }
         XCTAssertNotEqual((rel as NSString).lastPathComponent.lowercased(), "index.html")
+    }
+
+    func test_flatAndNotesHierarchyPlacementsRemainDistinctAcrossAccountsAndFolders() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-folder-layout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = NotesNote(
+            id: "first", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "notes", accountId: "icloud", attachments: []
+        )
+        let second = NotesNote(
+            id: "second", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "work/projects", accountId: "icloud", attachments: []
+        )
+        let third = NotesNote(
+            id: "third", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "notes", accountId: "local", attachments: []
+        )
+        let hierarchy = [
+            "iCloud": ["Notes": [first], "Work/Projects": [second]],
+            "On My Mac": ["Notes": [third]]
+        ]
+
+        let flat = flattenExportHierarchy(hierarchy, outputRoot: root, organization: .allTogether)
+        XCTAssertEqual(flat.count, 3)
+        XCTAssertTrue(flat.allSatisfy { $0.folderURL.standardizedFileURL == root.standardizedFileURL })
+
+        let mirrored = flattenExportHierarchy(hierarchy, outputRoot: root, organization: .asInNotes)
+        var folderByID: [String: String] = [:]
+        for placement in mirrored {
+            XCTAssertNil(
+                folderByID.updateValue(placement.folderURL.standardizedFileURL.path, forKey: placement.note.id),
+                "Synthetic fixture note IDs must remain unique"
+            )
+        }
+        XCTAssertEqual(folderByID["first"], root.appendingPathComponent("iCloud/Notes").standardizedFileURL.path)
+        XCTAssertEqual(folderByID["second"], root.appendingPathComponent("iCloud/Work/Projects").standardizedFileURL.path)
+        XCTAssertEqual(folderByID["third"], root.appendingPathComponent("On My Mac/Notes").standardizedFileURL.path)
+    }
+
+    func test_internalLinkAllocationReservesExistingNoteAndAttachmentSidecarNames() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-link-collision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("existing note".utf8).write(to: root.appendingPathComponent("Shared.pdf"))
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("Shared (Attachments)"), withIntermediateDirectories: true
+        )
+
+        func attachedNote(_ id: String) -> NotesNote {
+            NotesNote(
+                id: id, title: "Shared", plaintext: "", htmlBody: nil,
+                creationDate: Date(), modificationDate: Date(), folderId: "Notes", accountId: "iCloud",
+                attachments: [NotesAttachment(id: "synthetic-\(id)", typeUTI: "public.data", filename: "fixture.bin")]
+            )
+        }
+        let first = attachedNote("first")
+        let second = attachedNote("second")
+        let map = buildInternalLinkPathMap(
+            allNotes: [first, second],
+            notesWithPaths: [(note: first, folderURL: root), (note: second, folderURL: root)],
+            outputRoot: root, format: .pdf, addDatePrefix: false, dateFormat: "yyyy-MM-dd",
+            existingManifest: nil, includeAttachments: true, sharedAttachmentsFolder: false
+        )
+
+        XCTAssertEqual(map[first.id], "Shared (2).pdf")
+        XCTAssertEqual(map[second.id], "Shared (3).pdf")
+        let firstAttachmentFolder = attachmentExportLocation(
+            sharedDump: false, outputRoot: root, noteDirectory: root,
+            noteBaseName: "Shared (2)", filename: "fixture.bin"
+        ).directory
+        let secondAttachmentFolder = attachmentExportLocation(
+            sharedDump: false, outputRoot: root, noteDirectory: root,
+            noteBaseName: "Shared (3)", filename: "fixture.bin"
+        ).directory
+        XCTAssertEqual(firstAttachmentFolder.lastPathComponent, "Shared (2) (Attachments)")
+        XCTAssertEqual(secondAttachmentFolder.lastPathComponent, "Shared (3) (Attachments)")
+    }
+
+    func test_internalLinksFollowAllocatedPathsAcrossMirroredFolders() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-relative-link-\(UUID().uuidString)")
+        let sourceFolder = root.appendingPathComponent("Fixture/Notes", isDirectory: true)
+        let targetFolder = root.appendingPathComponent("Fixture/Work", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: targetFolder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        var source = NotesNote(
+            id: "source", title: "Source", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "Notes", accountId: "Fixture", attachments: []
+        )
+        source.identifier = "11111111-1111-1111-1111-111111111111"
+        var target = NotesNote(
+            id: "target", title: "Target", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "Work", accountId: "Fixture", attachments: []
+        )
+        target.identifier = "22222222-2222-2222-2222-222222222222"
+
+        let map = buildInternalLinkPathMap(
+            allNotes: [source, target],
+            notesWithPaths: [
+                (note: source, folderURL: sourceFolder),
+                (note: target, folderURL: targetFolder)
+            ],
+            outputRoot: root,
+            format: .markdown,
+            addDatePrefix: false,
+            dateFormat: "yyyy-MM-dd",
+            existingManifest: nil
+        )
+        let rewritten = rewriteInternalLinks(
+            html: "<a href=\"applenotes:note/22222222-2222-2222-2222-222222222222\">Target</a>",
+            currentNoteRelativePath: map[source.id]!,
+            noteIdToRelativePath: map
+        )
+
+        XCTAssertEqual(map[target.identifier], "Fixture/Work/Target.md")
+        XCTAssertTrue(rewritten.contains("href=\"../Work/Target.md\""), rewritten)
     }
 
     // MARK: - defaultNotesFolder / localized default folder

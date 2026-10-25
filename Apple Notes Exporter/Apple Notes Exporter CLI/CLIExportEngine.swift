@@ -154,14 +154,14 @@ actor CLIExportEngine {
             syncTracker = isSync ? SyncManifestTracker(manifest: .empty()) : nil
         }
 
-        // Build account/folder hierarchy for output directory structure
+        // Build account/folder hierarchy for output directory structure.
         let hierarchy = try await organizeNotesByHierarchy(notesToExport)
+        let usesSingleFileLayout = configurations.concatenateOutput && format.supportsConcatenation
+        let folderOrganization: ExportFolderOrganization =
+            (isSync || usesSingleFileLayout) ? .asInNotes : configurations.folderOrganization
 
-        // Create directory structure. Concatenating writes one file and no
-        // tree, so creating it would leave empty account and folder directories
-        // beside the file, and when --output names the file it would create a
-        // directory at that exact path for the final write to collide with.
-        if !configurations.concatenateOutput {
+        // Create only the paths that the selected folder organization uses.
+        if !usesSingleFileLayout && folderOrganization == .asInNotes {
             for (accountName, folders) in hierarchy {
                 let accountURL = outputURL.appendingPathComponent(sanitizeExportFilename(accountName))
                 try FileManager.default.createDirectory(at: accountURL, withIntermediateDirectories: true)
@@ -172,8 +172,14 @@ actor CLIExportEngine {
             }
         }
 
-        // Flatten for concurrent export
-        let notesWithPaths = flattenExportHierarchy(hierarchy, outputRoot: outputURL)
+        // Flatten for concurrent export. Concatenation keeps its established
+        // per-note context, but the organization preference does not apply.
+        let placementOrganization = usesSingleFileLayout ? .asInNotes : folderOrganization
+        let notesWithPaths = flattenExportHierarchy(
+            hierarchy,
+            outputRoot: outputURL,
+            organization: placementOrganization
+        )
 
         // Pre-allocate filenames so applenotes:note/UUID links can be rewritten
         // to real relative paths during rendering.
@@ -184,7 +190,9 @@ actor CLIExportEngine {
             format: format,
             addDatePrefix: configurations.addDateToFilename,
             dateFormat: configurations.filenameDateFormat.rawValue,
-            existingManifest: existingManifest
+            existingManifest: existingManifest,
+            includeAttachments: includeAttachments,
+            sharedAttachmentsFolder: configurations.sharedAttachmentsFolder
         )
         defer { self.internalLinkMap = [:] }
 
@@ -213,7 +221,7 @@ actor CLIExportEngine {
         // Set folder timestamps. Concatenating creates no tree (see above), and
         // stamping a directory that was never created throws, which would fail
         // the run after the file had already been written successfully.
-        if !configurations.concatenateOutput {
+        if !usesSingleFileLayout && folderOrganization == .asInNotes {
             try await setExportFolderTimestamps(hierarchy: hierarchy, outputURL: outputURL)
         }
 

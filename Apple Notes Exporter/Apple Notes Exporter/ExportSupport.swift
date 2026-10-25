@@ -295,49 +295,95 @@ func buildInternalLinkPathMap(
     format: ExportFormat,
     addDatePrefix: Bool,
     dateFormat: String,
-    existingManifest: SyncManifest?
+    existingManifest: SyncManifest?,
+    includeAttachments: Bool = false,
+    sharedAttachmentsFolder: Bool = false
 ) -> [String: String] {
     var map: [String: String] = [:]
+    var reservedByFolder: [String: Set<String>] = [:]
+    let rootPath = outputRoot.standardizedFileURL.path
+    let fileManager = FileManager.default
 
-    // Start with any paths already recorded from previous sync runs.
+    func folderKey(_ url: URL) -> String { url.standardizedFileURL.path }
+    func folded(_ name: String) -> String { name.lowercased() }
+
+    func reserve(_ filename: String, in directory: URL) {
+        reservedByFolder[folderKey(directory), default: []].insert(folded(filename))
+    }
+
+    func existingNames(in directory: URL) -> Set<String> {
+        let names = (try? fileManager.contentsOfDirectory(atPath: directory.path)) ?? []
+        return Set(names.map(folded))
+    }
+
+    // Existing sync entries keep their exact paths and reserve their names even
+    // when the corresponding note is not part of this run.
     if let manifest = existingManifest {
         for (id, entry) in manifest.notes {
             map[id] = entry.exportedPath
+            let path = outputRoot.appendingPathComponent(entry.exportedPath).standardizedFileURL
+            reserve(path.lastPathComponent, in: path.deletingLastPathComponent())
         }
     }
-
-    // Pre-allocate filenames for notes being exported this run.
-    var reservedByFolder: [String: Set<String>] = [:]
-    let rootPath = outputRoot.standardizedFileURL.path
 
     for pair in notesWithPaths {
         let note = pair.note
         let folderURL = pair.folderURL
 
+        // A sync re-export intentionally overwrites its manifest-owned file.
+        // Keep links aligned with the manifest path rather than allocating a
+        // second name for the same note.
+        if let existingPath = existingManifest?.notes[note.id]?.exportedPath {
+            map[note.id] = existingPath
+            if !note.identifier.isEmpty { map[note.identifier] = existingPath }
+            continue
+        }
+
+        let safeTitle = sanitizeExportFilename(note.sanitizedFileName)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let noteBase = safeTitle.isEmpty || safeTitle == "." || safeTitle == ".."
+            ? "Untitled Note" : safeTitle
         let baseName: String
         if addDatePrefix {
             let formatter = DateFormatter()
             formatter.dateFormat = dateFormat
-            baseName = "\(formatter.string(from: note.creationDate)) \(note.sanitizedFileName)"
+            baseName = "\(formatter.string(from: note.creationDate)) \(noteBase)"
         } else {
-            baseName = note.sanitizedFileName
+            baseName = noteBase
         }
 
-        let folderKey = folderURL.standardizedFileURL.path
-        var used = reservedByFolder[folderKey] ?? []
+        let folder = folderKey(folderURL)
+        var used = reservedByFolder[folder] ?? []
+        used.formUnion(existingNames(in: folderURL))
         // HTML exports write index.html as a folder listing; never let a note claim that name.
-        if format == .html {
-            used.insert("index.html")
-        }
+        if format == .html { used.insert("index.html") }
 
-        var filename = "\(baseName).\(format.fileExtension)"
-        var counter = 2
-        while used.contains(filename) && counter <= 10000 {
-            filename = "\(baseName) (\(counter)).\(format.fileExtension)"
+        var counter = 1
+        var filename = ""
+        while true {
+            let suffix = counter == 1 ? "" : " (\(counter))"
+            filename = "\(baseName)\(suffix).\(format.fileExtension)"
+            let candidatePath = folderURL.appendingPathComponent(filename)
+            var collides = used.contains(folded(filename))
+                || fileManager.fileExists(atPath: candidatePath.path)
+
+            if !collides, includeAttachments, note.hasAttachments, !sharedAttachmentsFolder {
+                let sidecar = attachmentExportLocation(
+                    sharedDump: sharedAttachmentsFolder,
+                    outputRoot: outputRoot,
+                    noteDirectory: folderURL,
+                    noteBaseName: "\(baseName)\(suffix)",
+                    filename: "placeholder"
+                ).directory
+                collides = fileManager.fileExists(atPath: sidecar.path)
+            }
+
+            if !collides { break }
             counter += 1
         }
-        used.insert(filename)
-        reservedByFolder[folderKey] = used
+
+        used.insert(folded(filename))
+        reservedByFolder[folder] = used
 
         let fullPath = folderURL.appendingPathComponent(filename).standardizedFileURL.path
         let rel: String
@@ -350,9 +396,7 @@ func buildInternalLinkPathMap(
         }
         // Links in note bodies use ZIDENTIFIER (UUID), not the Core Data PK.
         map[note.id] = rel
-        if !note.identifier.isEmpty {
-            map[note.identifier] = rel
-        }
+        if !note.identifier.isEmpty { map[note.identifier] = rel }
     }
 
     return map
@@ -637,7 +681,8 @@ typealias NoteExportPlacement = (note: NotesNote, folderURL: URL, folderName: St
 /// reproducible, and two engines exporting the same library disagreed.
 func flattenExportHierarchy(
     _ hierarchy: [String: [String: [NotesNote]]],
-    outputRoot: URL
+    outputRoot: URL,
+    organization: ExportFolderOrganization = .asInNotes
 ) -> [NoteExportPlacement] {
     var placements: [NoteExportPlacement] = []
     for accountName in hierarchy.keys.sorted() {
@@ -645,7 +690,9 @@ func flattenExportHierarchy(
         let accountURL = outputRoot.appendingPathComponent(sanitizeExportFilename(accountName))
         for folderPath in folders.keys.sorted() {
             guard let folderNotes = folders[folderPath] else { continue }
-            let folderURL = accountURL.appendingPathComponent(folderPath)
+            let folderURL = organization == .allTogether
+                ? outputRoot
+                : accountURL.appendingPathComponent(folderPath)
             for note in folderNotes {
                 placements.append((note: note, folderURL: folderURL,
                                    folderName: folderPath, accountName: accountName))

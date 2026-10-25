@@ -578,6 +578,32 @@ struct AppleNotesExporterView: View {
 
             let isZip = exportViewModel.configurations.zipOutput || exportViewModel.configurations.tarOutput
             let isSingle = exportViewModel.configurations.concatenateOutput && !isZip
+            let usesSingleFileLayout = exportViewModel.configurations.concatenateOutput
+                && selectedFormat.supportsConcatenation
+            if !usesSingleFileLayout && !exportViewModel.configurations.incrementalSync {
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Organizzazione")
+                            .font(.subheadline.weight(.medium))
+                        Text(exportViewModel.configurations.folderOrganization == .allTogether
+                             ? "Salva le note direttamente nella destinazione scelta."
+                             : "Conserva le cartelle e gli account di Note.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Picker("Organizzazione", selection: $exportViewModel.configurations.folderOrganization) {
+                        Text("Tutte insieme").tag(ExportFolderOrganization.allTogether)
+                        Text("Come in Note").tag(ExportFolderOrganization.asInNotes)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 220)
+                    .accessibilityIdentifier("folderOrganizationPicker")
+                }
+                .padding(.vertical, 4)
+            }
+
             if !isSingle {
                 OutputOptionRow(
                     title: "Add date to filename",
@@ -617,6 +643,7 @@ struct AppleNotesExporterView: View {
                             Button("Preferenze formato…") { showFormatOptionsView = true }
                         }
                         Button("Opzioni avanzate…") { showAdvancedOutputOptionsView = true }
+                            .accessibilityIdentifier("advancedOutputOptionsButton")
                         Divider()
                         Button("Configurazione MCP…") { showMCPSetupView = true }
                         Button("Permessi e licenza…") { showLicensePermissionsView = true }
@@ -752,6 +779,7 @@ struct AppleNotesExporterView: View {
         .onChange(of: exportViewModel.configurations.addDateToFilename) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.filenameDateFormat) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.folderOrganization) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.styleProfile) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.attachmentMode) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.fontFamily) { _ in exportViewModel.saveConfigurations() }
@@ -760,6 +788,7 @@ struct AppleNotesExporterView: View {
         .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.marginUnit) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.pageSize) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.folderOrganization) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.incrementalSync) { _ in
             exportViewModel.saveConfigurations()
@@ -974,6 +1003,16 @@ private struct PDFPreviewSheet: View {
                     .accessibilityIdentifier("pdfPreviewStatus")
                     .font(.subheadline)
                     .foregroundColor(previewModel.isUpdating ? .secondary : .green)
+
+                    Button {
+                        isPresented = false
+                    } label: {
+                        Label("Chiudi", systemImage: "xmark")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("pdfPreviewCloseButton")
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
@@ -1020,11 +1059,6 @@ private struct PDFPreviewSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(SwiftUI.Color(nsColor: .underPageBackgroundColor))
             }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            Button("Chiudi") { isPresented = false }
-                .keyboardShortcut(.cancelAction)
-                .padding(18)
         }
         .onAppear { refreshPreview() }
         .onChange(of: selectedNoteID) { _ in refreshPreview() }

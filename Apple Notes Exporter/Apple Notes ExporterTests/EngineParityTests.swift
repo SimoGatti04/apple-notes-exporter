@@ -665,6 +665,46 @@ final class EngineParityTests: XCTestCase {
         XCTAssertEqual(processor.diagnostics.count, 6)
     }
 
+    func test_standalonePDFAttachmentCardsAreStaticAndNeverTargetStagingFiles() throws {
+        let db = try openAttachmentTestDatabase()
+        defer { sqlite3_close(db) }
+        let attachmentID = "synthetic-card-pdf"
+        let attachmentBytes = try makeSyntheticPDF(pageCount: 1)
+        let attachment = NotesAttachment(id: attachmentID, typeUTI: "com.adobe.pdf", filename: "fixture <guide>.pdf")
+        let marker = "<span data-attachment-id=\"\(attachmentID)\" data-attachment-type=\"com.adobe.pdf\">\u{FFFC}</span>"
+
+        for mode in PDFAttachmentMode.allCases {
+            let processor = HTMLAttachmentProcessor(database: db)
+            let html = processor.processHTML(
+                html: "<p>Before</p>\(marker)<p>After</p>",
+                attachments: [attachment],
+                attachmentPaths: [attachmentID: "Attachments/fixture.pdf"],
+                exportDirectory: "/private/tmp/controlled-staging",
+                embedImages: true,
+                linkEmbeddedImages: false,
+                standalonePDF: true,
+                verifiedPDFDataByID: [attachmentID: attachmentBytes],
+                pdfAttachmentMode: mode
+            )
+
+            XCTAssertTrue(html.contains("<figure class=\"ane-pdf-attachment-card\""))
+            XCTAssertTrue(html.contains("fixture &lt;guide&gt;.pdf"))
+            XCTAssertFalse(html.contains("href="), "A static embedded-file card must not pretend to be a working link")
+            XCTAssertFalse(html.contains("file://"))
+            XCTAssertFalse(html.contains("controlled-staging"))
+            XCTAssertFalse(html.contains("Attachments/"))
+            XCTAssertEqual(processor.embeddedPDFInsertions.count, 1)
+            XCTAssertEqual(processor.embeddedPDFInsertions.first?.data, attachmentBytes)
+            XCTAssertEqual(processor.embeddedPDFInsertions.first?.filename, attachment.filename)
+
+            if mode == .embedOnly {
+                XCTAssertFalse(html.contains("ane-pdf-attachment-preview"))
+            } else {
+                XCTAssertTrue(html.contains("ane-pdf-attachment-preview"))
+            }
+        }
+    }
+
     func test_standaloneProcessorReportsUnavailableImageWithoutStagingLink() throws {
         let db = try openAttachmentTestDatabase()
         defer { sqlite3_close(db) }
@@ -747,6 +787,7 @@ final class EngineParityTests: XCTestCase {
         let viewModel = ExportViewModel(
             repository: DatabaseNotesRepository(databasePath: db), databasePath: db
         )
+        viewModel.configurations.folderOrganization = .asInNotes
 
         await viewModel.exportNotes([makeNote()], toDirectory: output, format: .pdf)
 
@@ -758,6 +799,72 @@ final class EngineParityTests: XCTestCase {
             .filter { $0.pathExtension.lowercased() == "pdf" } ?? []
         XCTAssertEqual(pdfs.count, 1)
         XCTAssertGreaterThan(pdfs[0].pathComponents.count, output.pathComponents.count + 1)
+    }
+
+    func test_appAndCLIRespectFlatAndNotesFolderOrganization() async throws {
+        let db = try makeFixtureDatabase()
+        let expectedPaths: [ExportFolderOrganization: Set<String>] = [
+            .allTogether: ["First Note.md", "Second Note & Friends.md", "Work Note.md"],
+            .asInNotes: [
+                "Fixture/Notes/First Note.md",
+                "Fixture/Notes/Second Note & Friends.md",
+                "Fixture/Work/Work Note.md"
+            ]
+        ]
+
+        for organization in [ExportFolderOrganization.allTogether, .asInNotes] {
+            let appOut = try makeOutputDirectory()
+            let cliOut = try makeOutputDirectory()
+            try await exportViaApp(format: .markdown, db: db, to: appOut) {
+                $0.folderOrganization = organization
+            }
+            try await exportViaCLI(format: .markdown, db: db, to: cliOut) {
+                $0.folderOrganization = organization
+            }
+
+            let appFiles = filesUnder(appOut)
+            let cliFiles = filesUnder(cliOut)
+            XCTAssertEqual(Set(appFiles.keys), expectedPaths[organization])
+            XCTAssertEqual(Set(cliFiles.keys), expectedPaths[organization])
+            XCTAssertEqual(appFiles, cliFiles, "App and CLI output should agree for \(organization)")
+        }
+    }
+
+    func test_appArchiveExportsHonorFlatAndNotesOrganizationForZIPAndTAR() async throws {
+        let db = try makeFixtureDatabase()
+        let repository = DatabaseNotesRepository(databasePath: db)
+        let notes = try await repository.fetchNotes(includeDeleted: false)
+        let expectedNoteNames: Set<String> = ["First Note.md", "Second Note & Friends.md", "Work Note.md"]
+
+        for organization in [ExportFolderOrganization.allTogether, .asInNotes] {
+            for archiveFormat in [ExportArchiveFormat.zip, .tar] {
+                let output = try makeOutputDirectory()
+                let viewModel = ExportViewModel(repository: repository, databasePath: db)
+                var configurations = ExportConfigurations.default
+                configurations.folderOrganization = organization
+                configurations.destination.container = archiveFormat == .zip ? .zip : .tar
+                viewModel.configurations = configurations
+
+                await viewModel.exportNotes(notes, toDirectory: output, format: .markdown, includeAttachments: true)
+                guard case .completed = viewModel.exportState,
+                      let archiveURL = viewModel.lastExportArtifactURL else {
+                    return XCTFail("Expected \(archiveFormat) archive for \(organization): \(viewModel.exportLog)")
+                }
+                XCTAssertEqual(archiveURL.pathExtension.lowercased(), archiveFormat.fileExtension)
+                let members = archiveFormat == .zip
+                    ? zipMembers(at: archiveURL)
+                    : tarMembers(at: archiveURL)
+                let noteMembers = Set(members.filter { $0.lowercased().hasSuffix(".md") })
+                XCTAssertEqual(noteMembers.count, 3, "Unexpected archive contents: \(members)")
+                XCTAssertEqual(Set(noteMembers.map { URL(fileURLWithPath: $0).lastPathComponent }), expectedNoteNames)
+
+                if organization == .allTogether {
+                    XCTAssertTrue(noteMembers.allSatisfy { !$0.contains("/Fixture/") }, "Flat archive retained account paths: \(noteMembers)")
+                } else {
+                    XCTAssertTrue(noteMembers.allSatisfy { $0.contains("/Fixture/") }, "Mirrored archive lost account paths: \(noteMembers)")
+                }
+            }
+        }
     }
 
     func test_multiNotePDFExportDeliversOnePDFPerSelectedNote() async throws {
@@ -1027,6 +1134,8 @@ final class EngineParityTests: XCTestCase {
                       let afterBounds = exportedPDF.findString("After", withOptions: []).first?.bounds(for: notePage) else {
                     return XCTFail("The note text and attachment reference must all render in \(scenario)")
                 }
+                XCTAssertTrue(notePage.annotations.isEmpty,
+                              "The static attachment card must not contain a misleading temporary-file link (\(scenario))")
                 // PDFKit's extracted string order is not a visual-order contract;
                 // compare rendered coordinates instead (PDF origin is bottom-left).
                 XCTAssertGreaterThan(beforeBounds.midY, attachmentBounds.midY,
@@ -1053,6 +1162,23 @@ final class EngineParityTests: XCTestCase {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         process.arguments = ["-Z1", url.path]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        guard (try? process.run()) != nil else { return [] }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return [] }
+        return Set(String(decoding: data, as: UTF8.self)
+            .split(separator: "\n")
+            .map(String.init))
+    }
+
+    /// The names of the files inside a tar container, or empty if it is not one.
+    private func tarMembers(at url: URL) -> Set<String> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-tf", url.path]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = Pipe()

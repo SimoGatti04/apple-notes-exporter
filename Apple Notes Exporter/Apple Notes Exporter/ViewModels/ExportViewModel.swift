@@ -546,13 +546,18 @@ class ExportViewModel: ObservableObject {
                 message: isSync ? "Starting incremental sync..." : "Starting export..."
             ))
 
-            // Group notes by account and folder for organized output
+            // A folder tree can either flatten all notes into the selected
+            // destination or preserve their Apple Notes account/folder paths.
+            // Sync and concatenated exports have established path semantics and
+            // intentionally ignore this presentation preference.
             let hierarchy = try await organizeNotesByHierarchy(notesToExport)
+            let usesSingleFileLayout = configurations.concatenateOutput && format.supportsConcatenation
+            let folderOrganization: ExportFolderOrganization =
+                (isSync || usesSingleFileLayout) ? .asInNotes : configurations.folderOrganization
 
-            // Create all directory structure upfront. Single File writes one
-            // file and no tree, so creating it would leave an empty copy of the
-            // whole folder hierarchy sitting beside that file.
-            if singleFileURL == nil {
+            // Create the hierarchy only when it will be written. In the flat
+            // mode the chosen destination itself is every note's parent folder.
+            if singleFileURL == nil && folderOrganization == .asInNotes {
                 for (accountName, folders) in hierarchy {
                     let accountURL = outputURL.appendingPathComponent(sanitizeExportFilename(accountName))
                     try FileManager.default.createDirectory(at: accountURL, withIntermediateDirectories: true)
@@ -564,8 +569,14 @@ class ExportViewModel: ObservableObject {
                 }
             }
 
-            // Flatten notes with their folder paths for concurrent export
-            let notesWithPaths = flattenExportHierarchy(hierarchy, outputRoot: outputURL)
+            // Preserve the old logical paths for concatenation, where no
+            // individual per-note document path is actually delivered.
+            let placementOrganization = usesSingleFileLayout ? .asInNotes : folderOrganization
+            let notesWithPaths = flattenExportHierarchy(
+                hierarchy,
+                outputRoot: outputURL,
+                organization: placementOrganization
+            )
 
             // Pre-allocate filenames so applenotes:note/UUID internal links can be
             // rewritten to actual relative file paths during rendering.
@@ -577,7 +588,9 @@ class ExportViewModel: ObservableObject {
                 format: format,
                 addDatePrefix: configurations.addDateToFilename,
                 dateFormat: configurations.filenameDateFormat.rawValue,
-                existingManifest: existingManifest
+                existingManifest: existingManifest,
+                includeAttachments: includeAttachments,
+                sharedAttachmentsFolder: configurations.sharedAttachmentsFolder
             )
             defer { self.internalLinkMap = [:] }
 
@@ -616,7 +629,7 @@ class ExportViewModel: ObservableObject {
 
             // Set folder timestamps based on their notes. Single File writes no
             // folder tree, and stamping paths that were never created throws.
-            if singleFileURL == nil {
+            if singleFileURL == nil && folderOrganization == .asInNotes {
                 try await setExportFolderTimestamps(hierarchy: hierarchy, outputURL: outputURL)
             }
 

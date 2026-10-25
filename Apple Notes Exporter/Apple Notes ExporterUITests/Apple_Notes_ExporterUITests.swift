@@ -59,11 +59,40 @@ final class Apple_Notes_ExporterUITests: XCTestCase {
         embedOnly.click()
         XCTAssertEqual(embedOnly.value as? String, "Selezionato")
 
-        app.buttons["previewButton"].click()
-        XCTAssertTrue(app.buttons["Chiudi"].waitForExistence(timeout: 5))
+        let advancedOptions = app.buttons["advancedOutputOptionsButton"]
+        XCTAssertTrue(advancedOptions.waitForExistence(timeout: 5))
+        advancedOptions.click()
+        let organizationPicker = app.segmentedControls["folderOrganizationPicker"]
+        XCTAssertTrue(organizationPicker.waitForExistence(timeout: 5))
+        XCTAssertTrue(organizationPicker.buttons["Tutte insieme"].exists)
+        XCTAssertTrue(organizationPicker.buttons["Come in Note"].exists)
+        organizationPicker.buttons["Come in Note"].click()
+        app.buttons["Fine"].click()
 
+        // The preference must survive an app restart, not only a re-render of
+        // the advanced-options popover.
+        app.terminate()
+        app.launch()
+        let reopenedAdvancedOptions = app.buttons["advancedOutputOptionsButton"]
+        XCTAssertTrue(reopenedAdvancedOptions.waitForExistence(timeout: 10))
+        reopenedAdvancedOptions.click()
+        let reopenedOrganizationPicker = app.segmentedControls["folderOrganizationPicker"]
+        XCTAssertTrue(reopenedOrganizationPicker.waitForExistence(timeout: 5))
+        XCTAssertTrue(reopenedOrganizationPicker.buttons["Come in Note"].isSelected)
+        reopenedOrganizationPicker.buttons["Tutte insieme"].click()
+        app.buttons["Fine"].click()
+
+        app.buttons["previewButton"].click()
         let previewDocument = app.descendants(matching: .any)["pdfPreviewDocument"]
         XCTAssertTrue(previewDocument.waitForExistence(timeout: 20))
+        let closeButton = app.buttons["pdfPreviewCloseButton"]
+        XCTAssertTrue(closeButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(closeButton.isHittable)
+        XCTAssertLessThanOrEqual(
+            closeButton.frame.maxY,
+            previewDocument.frame.minY,
+            "The close control must remain in the fixed toolbar, outside the PDF page area"
+        )
 
         let stylePicker = app.segmentedControls["previewStylePicker"]
         XCTAssertTrue(stylePicker.exists)
@@ -74,7 +103,13 @@ final class Apple_Notes_ExporterUITests: XCTestCase {
         expectation(for: refreshed, evaluatedWith: status)
         waitForExpectations(timeout: 20)
 
-        app.buttons["Chiudi"].click()
+        closeButton.click()
+        XCTAssertFalse(previewDocument.waitForExistence(timeout: 2))
+
+        app.buttons["previewButton"].click()
+        XCTAssertTrue(previewDocument.waitForExistence(timeout: 20))
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertFalse(previewDocument.waitForExistence(timeout: 3), "Escape should dismiss the preview")
     }
 
     func testNoteSelectionIsIndependentAndSurvivesSearchAndFolderScopes() throws {

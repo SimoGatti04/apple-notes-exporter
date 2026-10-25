@@ -293,3 +293,60 @@ The default build without the command-line override is blocked by the installed 
 - `docs/notes-to-pdf/INTEGRATION_REPORT.md`
 
 No real-note data or personal notes were added to tests, fixtures, or documentation.
+
+## 13. P3-D — final corrections after manual acceptance — 2026-10-25
+
+**Worktree:** `/Users/gatti/.codex/worktrees/notes-pdf-integration/apple-notes-exporter`
+**Branch / base:** `codex/notes-pdf-integration` / `9ff08914ea694cc83b99c6131f34c61f0197bd52`
+**Checkpoint status:** local changes verified for the completed portions; **not ready for merge** while exact emoji text extraction and UI-runner verification remain open.
+
+### Preflight and preserved working state
+
+The current managed integration worktree was attached to this task. Its HEAD matched the requested base, and its initial dirty state exactly matched the preceding handoff; no unexpected source changes were found. The eight files already modified on arrival were:
+
+- `Apple Notes Exporter/Apple Notes Exporter CLI/CLIExportEngine.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/AppleNotesExporterView.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ExportSupport.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/Models/ExportConfiguration.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ViewModels/ExportViewModel.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/EngineParityTests.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
+- `Apple Notes Exporter/Apple Notes ExporterUITests/Apple_Notes_ExporterUITests.swift`
+
+These were uncommitted at inspection, so Git cannot attribute their authorship or earlier destination. They were preserved; no reset, rebase, push, merge, or worktree cleanup was performed. The canonical checkout and the four source worktrees were not modified. The permanent app deployment target remains 11.0; the macOS 13.0 value used for the successful build/test run was a command-line diagnostic override only.
+
+### Findings
+
+- **F1 — highlighted run boundaries: partially corrected; exact-text acceptance remains open.** The verified cause of the observed artificial spaces is horizontal padding on adjacent `<mark>` runs: the PDF fixture’s source contains `sviluppo`, while the prior padded positive control extracts as `svi luppo`. Both PDF style profiles now use zero horizontal highlight padding and square adjacent boundaries. The synthetic two- and three-run fixtures cover equal/different highlight colors, true spaces, bold/italic, accented text, emoji, and hard line breaks. Faithful and Study PDF images show continuous highlights; `pdftotext -raw` contains `sviluppo`, `frammentazione`, `colori`, `prima e dopo`, and the other tested words without artificial splits. The padding positive control reproduces the split.
+
+  **Residual:** the rocket emoji renders visibly but is absent from both `PDFDocument.string`/copyable text and Poppler extraction. `pdffonts` reports MacRoman encoding with no Unicode map for the generated text fonts. Therefore exact text-copy fidelity for all Unicode/emoji is not established, and F1 must not be described as fully solved. No global whitespace normalization was introduced.
+
+- **F2 — preview close control: implementation and regression coverage present; runtime UI verification blocked.** The title and large `Chiudi` control are in a dedicated top row, outside the PDF document view; the row is not part of the scrolling document area, and the close button has the macOS cancel/Escape shortcut. The UI test checks the control is hittable and above the PDF region and covers Escape. The test runner bundle failed with a system error (`Testing was canceled` / UI-test runner error) before test cases connected; it yielded 0 passed UI cases, so resizing and interactive close behavior are not claimed as verified in this run. The earlier user-reported P3-C manual 7/7 acceptance remains the accepted baseline and was not changed.
+
+- **F3 — PDF attachment cards: no dead or staging link is emitted; the reported click failure was not reproduced as a page-card link.** In standalone-PDF mode the card is intentionally static: it contains the filename and has no `href`, `file://` URL, temporary path, or page URL annotation. The generated PDF stores attachments under the document-level `/EmbeddedFiles` name tree, rather than creating an external-file link from the visual card. On a synthetic two-page note PDF, Preview opened the document and displayed two pages; `pdfinfo -url` reported no URL links. `pdfdetach` listed and recovered the embedded `three-page-source.pdf`; SHA-256 of the recovered file exactly matched the source (`abf9f1f87b0c9290f1e8cfe594e83014d07fe57895565925b04f1e7a8751cb86`). The base note PDF and the same note with the embedded file both have 2 pages. The attachment’s embedded-file recovery is verified; opening/extracting it through Preview’s own attachment UI and reproducing the user's earlier permission message were not verified. No Acrobat Reader check was run, as requested. The static card must not be represented as clickable.
+
+- **F4 — output organization: implemented and covered.** The persisted preference defaults to **Tutte insieme**, with legacy configurations lacking the key decoding to that default. The save-options UI uses **Tutte insieme** and **Come in Note**. App and CLI placement paths, duplicate-title allocation, attachment-sidecar collision avoidance, account/folder hierarchy placement, internal links, and ZIP/TAR export behavior have synthetic regression coverage. The UI test includes persistence across relaunch, but that UI assertion shares the runner block above and is not claimed as executed successfully.
+
+### Validation actually completed
+
+| Check | Result |
+|---|---|
+| App build with command-line `MACOSX_DEPLOYMENT_TARGET=13.0` override | **PASS** (separate build recorded in this checkpoint) |
+| App/unit test scheme | **PASS — 206 passed, 0 failed, 0 skipped**; result bundle `/private/tmp/ANE-P3D-unit-suite.xcresult` |
+| Focused highlighted-run Faithful/Study PDF regression | **PASS — 1 passed, 0 failed**; `/private/tmp/ANE-P3D-F1-final-focused.xcresult` |
+| Offline format × destination matrix with synthetic fixture | **PASS — 68 passed, 0 failed** (18 formats; folder, ZIP, TAR, and single-file where supported) |
+| ZIP smoke check using synthetic data outside the sandboxed file-coordination context | **PASS**; the earlier sandboxed run failed at macOS `NSFileCoordinator` ZIP creation, not at output validation |
+| Embedded-file recovery / page-count / link inspection | **PASS** for the checks described under F3 |
+| UI test runner | **BLOCKED — 0 UI test cases ran; runner system failure before connection** |
+| `git diff --check` | **PASS** rerun after the report edit |
+| Manual resize and direct attachment-open/extract interaction in Preview | **NOT VERIFIED** |
+
+All automated inputs and exported PDFs used synthetic content. No personal Notes or attachments were used. The 68-cell matrix was rerun through the approved elevated path solely because sandboxed macOS file coordination had prevented ZIP creation; it completed with 68/68 passing.
+
+### Remaining known risks and merge gate
+
+1. Resolve or explicitly scope out the PDF renderer’s emoji/Unicode text-map loss, then assert exact extracted text across run boundaries without hiding artificial spaces through normalization.
+2. Re-run UI tests when the runner can establish a connection; verify preview resize, fixed header, button close, and Escape.
+3. Keep P2.2-E Monostile multiline boundaries, AppKit pending-print callback timeout, embedded-file support differences between readers, and stable Xcode ⌘R launch tracked separately. They are not resolved by P3-D.
+
+**Changed files for P3-D:** the eight pre-existing modified files listed in the preflight above, plus this report. The code changes and report remain local to `codex/notes-pdf-integration`; there was no push or merge.
