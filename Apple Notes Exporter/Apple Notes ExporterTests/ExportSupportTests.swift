@@ -1515,11 +1515,18 @@ final class ExportSupportTests: XCTestCase {
 
         let unpacked = root.appendingPathComponent("unpacked")
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        // This test checks the archive's timestamp metadata, not ditto's ZIP
+        // timestamp conversion. On macOS, ditto can interpret the DOS local
+        // timestamp with the standard-time offset during daylight saving time,
+        // even though the archive's UT extra field contains the correct UTC
+        // instant. Info-ZIP honors that field and keeps this assertion about
+        // the archive rather than the extractor's timezone behavior.
         let unzip = Process()
-        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        unzip.arguments = ["-x", "-k", archive.path, unpacked.path]
+        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        unzip.arguments = ["-q", archive.path, "-d", unpacked.path]
         try unzip.run()
         unzip.waitUntilExit()
+        XCTAssertEqual(unzip.terminationStatus, 0, "archive could not be expanded")
 
         let restored = unpacked.appendingPathComponent("Apple Notes Export/iCloud/Notes/Old Note.md")
         let attrs = try FileManager.default.attributesOfItem(atPath: restored.path)
