@@ -1008,8 +1008,11 @@ public func pdfDocumentCSS(options: PDFDocumentOptions) -> String {
         mark, .ane-highlight {
             background-color: #ffe58f !important;
             color: inherit;
-            padding: 0.1em 0.25em;
-            border-radius: 3px;
+            /* Horizontal padding and per-run rounding can separate adjacent
+               protobuf runs visually and in WebKit's PDF text layer. Keep the
+               fill flush to the glyphs and the run boundaries square. */
+            padding: 0.1em 0;
+            border-radius: 0;
             -webkit-box-decoration-break: clone;
             box-decoration-break: clone;
         }
@@ -1274,8 +1277,10 @@ public func pdfDocumentCSS(options: PDFDocumentOptions) -> String {
         mark, .ane-highlight {
             background-color: #fef08a !important;
             color: inherit;
-            padding: 0.12em 0.35em;
-            border-radius: 3px;
+            /* Keep adjacent style runs contiguous both visually and in the
+               PDF text layer; square boundaries avoid gaps between highlights. */
+            padding: 0.12em 0;
+            border-radius: 0;
             -webkit-box-decoration-break: clone;
             box-decoration-break: clone;
         }

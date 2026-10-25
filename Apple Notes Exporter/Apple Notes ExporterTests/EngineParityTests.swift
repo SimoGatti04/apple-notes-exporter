@@ -320,6 +320,81 @@ final class EngineParityTests: XCTestCase {
         XCTAssertNil(viewModel.lastExportArtifactURL)
     }
 
+    func test_highlightedTextAcrossProtobufRunsKeepsWordBoundariesInFaithfulAndStudyPDFs() async throws {
+        let db = try makeFixtureDatabase()
+        let segments: [(text: String, emphasis: Int32?, fontWeight: Int32)] = [
+            ("Two runs: ", nil, 0), ("svi", 1, 0), ("luppo", 1, 1), (" locale\n", nil, 0),
+            ("Three runs: ", nil, 0), ("fram", 1, 0), ("men", 1, 1), ("tazione", 1, 2),
+            ("\nDifferent colors: ", nil, 0), ("col", 1, 0), ("ori", 4, 0),
+            ("\nReal spaces: ", nil, 0), ("prima", 1, 0), (" ", nil, 0),
+            ("e", 4, 0), (" ", nil, 0), ("dopo", 2, 0), ("; ", nil, 0),
+            ("a b", 2, 0), ("\nUnicode: café ", nil, 0), ("🚀", nil, 2),
+            (" déjà-vu\nLine break: linea\nspezzata", nil, 0)
+        ]
+        func attributeRun(_ segment: (text: String, emphasis: Int32?, fontWeight: Int32)) -> AttributeRun {
+            var run = AttributeRun()
+            run.length = Int32(segment.text.utf16.count)
+            if let emphasis = segment.emphasis { run.emphasisStyle = emphasis }
+            if segment.fontWeight != 0 { run.fontWeight = segment.fontWeight }
+            return run
+        }
+
+        let sourceText = segments.map(\.text).joined()
+        var protobufNote = Note()
+        protobufNote.noteText = sourceText
+        protobufNote.attributeRun = segments.map(attributeRun)
+        let generatedHTML = NoteHTMLGenerator(database: nil).generateHTML(from: protobufNote)
+        XCTAssertTrue(generatedHTML.contains("<mark class=\"ane-highlight ane-highlight-purple\">svi</mark>"))
+        XCTAssertTrue(generatedHTML.contains("<mark class=\"ane-highlight ane-highlight-purple\"><b>luppo</b></mark>"))
+        XCTAssertTrue(generatedHTML.contains("ane-highlight-purple\">col"))
+        XCTAssertTrue(generatedHTML.contains("ane-highlight-mint\">ori"), generatedHTML)
+        XCTAssertTrue(generatedHTML.contains("café <i>🚀</i> déjà-vu"))
+
+        let note = makeNote(title: "Synthetic Highlight Runs", htmlBody: generatedHTML)
+        let paddingControl = makeNote(
+            title: "Synthetic Highlight Padding Control",
+            htmlBody: "<html><body><p>Padding control: <mark style=\"padding: 0.1em 4px\">svi</mark><mark style=\"padding: 0.1em 4px\">luppo</mark></p></body></html>"
+        )
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+
+        for profile in [PDFStyleProfile.faithful, .study] {
+            viewModel.configurations.pdf.styleProfile = profile
+            let data = try await viewModel.generatePDFPreviewData(for: note)
+            try data.write(to: URL(fileURLWithPath: "/private/tmp/ane-highlight-\(profile.rawValue).pdf"), options: .atomic)
+            let pdf = try XCTUnwrap(PDFDocument(data: data))
+            let extracted = try XCTUnwrap(pdf.string)
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "  +", with: " ", options: .regularExpression)
+
+            // PDFKit's aggregate string orders some styled drawing runs by their
+            // paint operations rather than reading order on macOS 27. Check each
+            // unbroken source token independently; Poppler's layout extraction is
+            // separately recorded in the integration report for reading order.
+            for token in ["sviluppo", "locale", "frammentazione", "colori", "prima", "e", "dopo", "a b", "café", "déjà-vu", "linea", "spezzata"] {
+                XCTAssertTrue(extracted.contains(token), "Missing PDF text token ‘\(token)’ in \(profile)")
+            }
+            for artificialSplit in ["svi luppo", "col ori", "fram mentazione", "pri ma"] {
+                XCTAssertFalse(extracted.contains(artificialSplit), "PDF introduced ‘\(artificialSplit)’ in \(profile)")
+            }
+
+            let controlData = try await viewModel.generatePDFPreviewData(for: paddingControl)
+            let controlPDF = try XCTUnwrap(PDFDocument(data: controlData))
+            let controlText = try XCTUnwrap(controlPDF.string)
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+            XCTAssertTrue(
+                controlText.contains("svi luppo"),
+                "Positive control should reproduce the WebKit separation caused by per-run horizontal padding"
+            )
+        }
+    }
+
     func test_singleNotePDFWritesFlatAndRemovesStagingDirectory() async throws {
         let db = try makeFixtureDatabase()
         let output = try makeOutputDirectory()
