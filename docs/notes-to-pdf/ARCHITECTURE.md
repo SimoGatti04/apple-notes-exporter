@@ -1,12 +1,12 @@
 # Architecture and integration contracts
 
-Status: design contract implemented and integrated for the first P2 vertical slice on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). This is not a claim that every target capability below is implemented. Change shared contracts only via integrator review, not concurrent agent edits.
+Status: design contract implemented through the P3 app integration checkpoint on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). This is not a claim that every target capability below is implemented or that real-library/UI acceptance is complete. Change shared contracts only via integrator review, not concurrent agent edits.
 
 ## Current implementation snapshot
-- Parser semantic classes are consumed by the PDF styling helper in the app's standalone PDF path.
-- The app persists Faithful/Study selection (Study default) and routes one-note PDF export through the flat standalone exporter. Multi-note PDF export remains one file per note; merge-to-one-PDF is deferred.
-- CSS owns the standalone PDF page margins while AppKit print margins are set to zero, avoiding the previously identified double-margin path. Non-PDF HTML keeps its legacy wrapper.
-- Inline images and supported HTML content can be represented in the PDF. Generic file attachments and Notes galleries are not embedded as portable originals; they are explicitly marked incomplete. See the validation report for exact evidence and other gaps.
+- Parser semantic classes are consumed by the PDF styling helper in the app's standalone PDF path. Monostile multiline block-boundary reconstruction remains an open experimental question (F2/P2.2-E); do not infer original block boundaries from visual line breaks alone.
+- The app persists Faithful/Study selection (Study default). Multiple selected notes export as separate flat PDFs through the shared selection/output flow; merge-to-one-PDF is deferred. Visible checklist state is separate from navigation focus.
+- CSS owns standalone PDF page margins while AppKit print margins are zero, avoiding the previously identified double-margin path. The explicit-project launcher is `scripts/run-integration-app.sh`; the stale-UI ⌘R root cause remains undetermined.
+- Inline images and supported HTML render in place. Verified PDF attachments are split at unique markers and inserted as native PDF pages, retaining source page geometry and vector content where PDFKit permits. Byte/page limits and fail-closed validation are applied; the original PDF is not embedded as an output attachment. Other unsupported file attachments and Notes galleries remain incomplete. See the validation report for evidence and limits.
 
 ## Existing source (inspected)
 - `Apple Notes Exporter/Apple Notes Exporter/AppleNotesKit/`: C database/attachment parser. Preserve, read-only access.

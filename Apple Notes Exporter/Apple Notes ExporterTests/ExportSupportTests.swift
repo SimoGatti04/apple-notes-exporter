@@ -18,11 +18,26 @@
 //  along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+import AppKit
+import CoreGraphics
+import PDFKit
 import XCTest
 import WebKit
 @testable import Apple_Notes_Exporter
 
 final class ExportSupportTests: XCTestCase {
+    private func attachRenderedPagePreviews(_ document: PDFDocument, profile: String) throws {
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index),
+                  let tiff = page.thumbnail(of: CGSize(width: 595, height: 842), for: .mediaBox).tiffRepresentation else {
+                throw PDFHTMLSequenceError.invalidComposedDocument
+            }
+            let attachment = XCTAttachment(data: tiff, uniformTypeIdentifier: "public.tiff")
+            attachment.name = "\(profile)-page-\(index + 1)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
 
     func test_pdfConfiguration_defaultsAndBackwardCompatibleDecoding() throws {
         let defaultConfiguration = PDFConfiguration.defaultConfiguration
@@ -1993,6 +2008,7 @@ extension ExportSupportTests {
             return
         }
         XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+        try attachRenderedPagePreviews(doc, profile: "Faithful")
 
         var fullText = ""
         for i in 0..<doc.pageCount {
@@ -2047,6 +2063,7 @@ extension ExportSupportTests {
             return
         }
         XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+        try attachRenderedPagePreviews(doc, profile: "Study")
 
         var fullText = ""
         for i in 0..<doc.pageCount {
@@ -2143,5 +2160,191 @@ final class PDFPrintCancellationTests: XCTestCase {
             // Expected: the AppKit-style completion gate returns only after
             // the pending print is released, then the caller observes cancel.
         }
+    }
+}
+
+
+// MARK: - Embedded PDF attachment sequence regression tests
+
+final class PDFHTMLSequenceComposerTests: XCTestCase {
+    private func makePDF(colors: [CGColor], pageSize: CGSize = CGSize(width: 300, height: 400)) throws -> Data {
+        let data = NSMutableData()
+        var mediaBox = CGRect(origin: .zero, size: pageSize)
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw PDFHTMLSequenceError.invalidComposedDocument
+        }
+        for color in colors {
+            context.beginPDFPage([kCGPDFContextMediaBox: mediaBox] as CFDictionary)
+            context.setFillColor(color)
+            context.fill(mediaBox)
+            context.endPDFPage()
+        }
+        context.closePDF()
+        return data as Data
+    }
+
+    private func insertion(_ id: String, colors: [CGColor]) throws -> PDFHTMLAttachmentInsertion {
+        PDFHTMLAttachmentInsertion(attachmentID: id, filename: "synthetic-\(id).pdf", data: try makePDF(colors: colors))
+    }
+
+    private func centerColor(of page: PDFPage) throws -> NSColor {
+        let thumbnail = page.thumbnail(of: CGSize(width: 40, height: 40), for: .mediaBox)
+        guard let tiff = thumbnail.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let color = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB) else {
+            throw PDFHTMLSequenceError.invalidComposedDocument
+        }
+        return color
+    }
+
+    func testSingleAndMultipageAttachmentsComposeAsAllVisiblePages() throws {
+        let first = try makePDF(colors: [CGColor(red: 0.9, green: 0.1, blue: 0.1, alpha: 1)])
+        let second = try makePDF(colors: [
+            CGColor(red: 0.1, green: 0.9, blue: 0.1, alpha: 1),
+            CGColor(red: 0.1, green: 0.1, blue: 0.9, alpha: 1)
+        ], pageSize: CGSize(width: 500, height: 200))
+        let documents = [
+            try PDFHTMLSequenceComposer.validatedAttachmentDocument(from: first, filename: "one.pdf"),
+            try PDFHTMLSequenceComposer.validatedAttachmentDocument(from: second, filename: "two-pages.pdf")
+        ]
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("pdf-sequence-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        XCTAssertEqual(try PDFHTMLSequenceComposer.write(documents: documents, to: output), 3)
+        let written = try XCTUnwrap(PDFDocument(url: output))
+        XCTAssertEqual(written.pageCount, 3)
+        XCTAssertEqual(written.page(at: 0)?.bounds(for: .mediaBox).size, CGSize(width: 300, height: 400))
+        XCTAssertEqual(written.page(at: 1)?.bounds(for: .mediaBox).size, CGSize(width: 500, height: 200))
+        XCTAssertEqual(written.page(at: 2)?.bounds(for: .mediaBox).size, CGSize(width: 500, height: 200))
+
+        // Render the final output and sample full-page synthetic fills. This
+        // verifies that content is visible and that page order survived PDFKit
+        // composition, rather than checking page-count metadata alone.
+        let visibleColors = try (0..<3).map { index in
+            try centerColor(of: XCTUnwrap(written.page(at: index)))
+        }
+        XCTAssertGreaterThan(visibleColors[0].redComponent, 0.7)
+        XCTAssertGreaterThan(visibleColors[1].greenComponent, 0.7)
+        XCTAssertGreaterThan(visibleColors[2].blueComponent, 0.7)
+    }
+
+    func testMultipleAndRepeatedAttachmentsKeepTheirHTMLPositionAndOrder() throws {
+        let first = try insertion("a", colors: [CGColor(red: 1, green: 0, blue: 0, alpha: 1)])
+        let repeated = try insertion("a", colors: [CGColor(red: 1, green: 0, blue: 0, alpha: 1)])
+        let second = try insertion("b", colors: [
+            CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ])
+        let html = "<html><head><title>Synthetic</title></head><body><p>before</p>\(first.markerHTML)<p>middle</p>\(repeated.markerHTML)<p>after one</p>\(second.markerHTML)<p>after two</p></body></html>"
+
+        let parts = try PDFHTMLSequenceComposer.parts(html: html, insertions: [second, repeated, first])
+        var orderedIDs: [String] = []
+        for part in parts {
+            if case .attachment(let item) = part { orderedIDs.append(item.attachmentID) }
+        }
+        XCTAssertEqual(orderedIDs, ["a", "a", "b"])
+        XCTAssertTrue(parts.count >= 7)
+        if case .html(let before) = parts.first {
+            XCTAssertTrue(before.contains("before"))
+            XCTAssertFalse(before.contains("middle"))
+        } else {
+            XCTFail("The text before the first attachment must remain the first segment")
+        }
+    }
+
+    func testMixedTextAndImageHTMLRemainAroundPDFMarker() throws {
+        let pdf = try insertion("scan", colors: [CGColor(red: 0.3, green: 0.4, blue: 0.5, alpha: 1)])
+        let html = "<html><head></head><body><p>text before</p><img src=\"data:image/png;base64,AA==\">\(pdf.markerHTML)<p>text after</p></body></html>"
+        let parts = try PDFHTMLSequenceComposer.parts(html: html, insertions: [pdf])
+        let htmlParts = parts.compactMap { part -> String? in
+            if case .html(let value) = part { return value }
+            return nil
+        }
+        XCTAssertEqual(htmlParts.count, 2)
+        XCTAssertTrue(htmlParts[0].contains("text before"))
+        XCTAssertTrue(htmlParts[0].contains("data:image/png;base64,AA=="))
+        XCTAssertTrue(htmlParts[1].contains("text after"))
+    }
+
+    func testDatabaseFallbackEmbedsOnlyPreviouslyVerifiedPDFBytes() throws {
+        let pdfData = try makePDF(colors: [CGColor(red: 0.2, green: 0.6, blue: 0.8, alpha: 1)])
+        let attachment = NotesAttachment(id: "verified-id", typeUTI: "com.adobe.pdf", filename: "verified.pdf")
+        let marker = #"<span data-attachment-id="verified-id" data-attachment-type="com.adobe.pdf">&#xFFFC;</span>"#
+
+        let verified = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: marker,
+            attachments: [attachment],
+            reason: "synthetic database fallback",
+            verifiedPDFDataByID: [attachment.id: pdfData]
+        )
+        XCTAssertEqual(verified.embeddedPDFInsertions.count, 1)
+        XCTAssertTrue(verified.html.contains("ane-pdf-attachment-marker"))
+        XCTAssertTrue(verified.incompleteAttachmentIDs.isEmpty)
+        XCTAssertTrue(verified.unplaceablePDFAttachmentIDs.isEmpty)
+
+        let unverified = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: marker,
+            attachments: [attachment],
+            reason: "synthetic database fallback"
+        )
+        XCTAssertTrue(unverified.embeddedPDFInsertions.isEmpty)
+        XCTAssertEqual(unverified.incompleteAttachmentIDs, [attachment.id])
+        XCTAssertEqual(unverified.unplaceablePDFAttachmentIDs, [attachment.id])
+        XCTAssertFalse(unverified.html.contains("ane-pdf-attachment-marker"))
+    }
+
+    func testAttachmentSizeAndCumulativeByteLimitsAreCheckedBeforeParsing() throws {
+        let oversized = Data(count: PDFHTMLSequenceComposer.maximumAttachmentBytes + 1)
+        XCTAssertThrowsError(try PDFHTMLSequenceComposer.validatedAttachmentDocument(
+            from: oversized,
+            filename: "oversized.pdf"
+        )) { error in
+            guard case PDFHTMLSequenceError.attachmentTooLarge("oversized.pdf") = error else {
+                return XCTFail("Expected the per-file size limit, got \(error)")
+            }
+        }
+
+        let validPDF = try makePDF(colors: [CGColor(red: 0.2, green: 0.3, blue: 0.4, alpha: 1)])
+        XCTAssertThrowsError(try PDFHTMLSequenceComposer.validatedAttachmentDocument(
+            from: validPDF,
+            filename: "over-total.pdf",
+            alreadyIncludedBytes: PDFHTMLSequenceComposer.maximumTotalAttachmentBytes
+        )) { error in
+            guard case PDFHTMLSequenceError.totalAttachmentBytesExceeded = error else {
+                return XCTFail("Expected the cumulative byte limit, got \(error)")
+            }
+        }
+    }
+
+    func testMissingMarkerAndCorruptPDFFailClosed() throws {
+        let item = try insertion("orphan", colors: [CGColor(red: 0, green: 0, blue: 0, alpha: 1)])
+        XCTAssertThrowsError(try PDFHTMLSequenceComposer.parts(
+            html: "<html><body><p>marker omitted</p></body></html>",
+            insertions: [item]
+        ))
+        XCTAssertThrowsError(try PDFHTMLSequenceComposer.validatedAttachmentDocument(
+            from: Data("not a PDF".utf8),
+            filename: "corrupt.pdf"
+        )) { error in
+            guard case PDFHTMLSequenceError.invalidAttachment("corrupt.pdf") = error else {
+                return XCTFail("Expected an invalid-attachment error, got \(error)")
+            }
+        }
+    }
+
+    func testCancellationDuringPageCompositionRemovesPartialOutput() throws {
+        let data = try makePDF(colors: [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        ])
+        let document = try PDFHTMLSequenceComposer.validatedAttachmentDocument(from: data, filename: "cancel.pdf")
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("pdf-cancel-\(UUID().uuidString).pdf")
+        var checks = 0
+        XCTAssertThrowsError(try PDFHTMLSequenceComposer.write(documents: [document], to: output) {
+            checks += 1
+            if checks == 2 { throw CancellationError() }
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
     }
 }

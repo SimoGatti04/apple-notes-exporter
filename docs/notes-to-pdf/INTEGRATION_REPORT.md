@@ -41,7 +41,7 @@ No merge conflicts remained. The shared `Apple_Notes_ExporterTests.swift` edits 
 - The parser's `ane-monostyle`, highlight, alignment, and blockquote semantic classes flow into the PDF styling helper. Parser regressions verify inline style transitions do not unbalance paragraph/list markup or alter plaintext.
 - Faithful and Study use separate CSS profiles. Page margins are supplied through CSS and AppKit print margins are zeroed on the styled PDF route, avoiding double application. Text remains selectable; rendering and pagination use WebKit/AppKit.
 - Inline raster/image content available to the standalone path is embedded in the PDF. Synthetic tests cover proportional landscape image rendering, tables, colored highlight, Monostyle, page breaks, and multi-page selectable text.
-- Missing inline images produce a partial result with an explicit diagnostic and no dead staging link. PDF/DOCX/Markdown/generic file attachments and Notes galleries are not portable embedded attachments in the standalone PDF: the PDF shows a descriptive reference, marks the content incomplete, and does not retain a temporary-file URL. Gallery child images are not all rendered in original order in this route.
+- Missing inline images produce a partial result with an explicit diagnostic and no dead staging link. At the P2 snapshot, PDF/DOCX/Markdown/generic file attachments and Notes galleries were not portable embedded attachments: the PDF showed a descriptive reference and marked the content incomplete. P3 supersedes only the PDF-page inclusion portion of that behavior; non-PDF attachments/galleries remain unsupported, and the source PDF is not embedded as a file. Gallery child images are not all rendered in original order in this route.
 
 ## 4. Verification environment and execution
 
@@ -111,7 +111,7 @@ The same machine, Xcode installation, OS, test scheme, and deployment-target dia
 
 1. **UI runner:** the full Xcode test action's UI runner terminated before bootstrapping. No claim is made that the search/profile/destination/export flow was clicked through. Existing UI test sources are boilerplate and do not test the new controls.
 2. **Real Notes:** no manual export from a real Apple Note was performed. Acceptance against representative real Notes content remains required before release/distribution.
-3. **Portable file attachments:** generic files (including PDF, DOCX, Markdown, and binary attachments) and Notes galleries are not embedded as portable originals or packaged with the standalone PDF. The output marks these incomplete. A companion archive or verified PDF embedded-file implementation remains a follow-up.
+3. **Portable file attachments (P2-era status):** at that checkpoint generic files (including PDF, DOCX, Markdown, and binary attachments) and Notes galleries were not included as portable originals. P3 adds visible PDF-page insertion; non-PDF files/galleries remain incomplete, and the original PDF is not separately embedded as an attachment file.
 4. **Timeout regression:** cancellation is covered, but a deterministic timeout-specific regression is not. Add one before claiming complete timeout/cancellation validation.
 5. **MCP:** no live MCP invocation was run. Existing CLI/app parity tests do not substitute for a direct MCP contract/session test.
 6. **Compiler note:** the candidate test build emitted a non-fatal warning for an unnecessary `await` around `setExportFolderTimestamps`; no compile error resulted.
@@ -203,3 +203,61 @@ The UI-runner failure matches the environment limitation already recorded in §6
 - `Apple Notes Exporter/Apple Notes ExporterTests/Apple_Notes_ExporterTests.swift`
 - `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
 - `docs/notes-to-pdf/INTEGRATION_REPORT.md`
+
+## 12. P3 — multiple selection, attached PDFs, and UX checkpoint
+
+**Decision: implementation checkpoint READY WITH LIMITATIONS; not release acceptance.**
+**Date:** 2026-10-25
+**Branch:** `codex/notes-pdf-integration`
+**P3 base:** `f5f48ffa180c0f555400a51165db6a6abb06b0c2`
+
+The implementation changes are local to the managed integration worktree. No push, merge, reset, cleanup, or source-worktree modification was performed. The automated fixtures and PDF previews use synthetic content only; no personal Notes were read into versioned fixtures.
+
+### P3-A — multiple note selection
+
+The selector now presents an explicit checkbox for each note, account/folder aggregate selection indicators, selected-note count, and clear/select actions. Selection is keyed by note IDs in the existing `NotesViewModel` selection state; highlighting a row remains navigation focus, not export selection. Filtering/browsing does not replace the selected-ID set. Existing output planning continues to produce one separate PDF per selected note, with the existing collision-safe naming path.
+
+A synthetic UI test was added, but it did **not** complete: the UI-test runner stalled before establishing its test connection. Therefore the interactive checkbox, cross-folder retention, keyboard accessibility, resize behavior, and export-dialog flow are not claimed as UI-accepted on this run.
+
+### P3-B — visible PDF attachment pages
+
+The PDF path fetches bytes only through the ownership-verified repository method. Each attachment occurrence receives a unique marker token; the renderer divides the surrounding HTML at those markers, renders the HTML portions, then composes the generated pages with the source PDF pages in order. The source `PDFPage` objects are inserted rather than converted to bitmaps, retaining their page sizes/rotation and vector/text content where PDFKit supports it. The output is re-opened and page-count checked before it is accepted. The original PDF is **not** separately embedded as a downloadable embedded-file attachment; embedded-file annotations were deferred, so compatibility across PDF viewers for that optional representation remains unverified.
+
+Safety bounds are 96 MiB per attachment, 256 MiB total attachment bytes, 500 pages per attachment, and 2,000 total inserted pages. Empty, locked, corrupt, oversized, missing, or unplaceable attachments fail the export rather than being silently omitted from an otherwise “complete” PDF. PNG/JPEG processing remains on its pre-existing path.
+
+### P3-C/P3-D — presentation and launch path
+
+The selector is reorganized around an account/folder sidebar and central note list, with visible selection state; existing export options and engine remain in place. A synthetic in-memory UI-test host avoids reading the user's Notes store. The helper `scripts/run-integration-app.sh` builds the explicit integration `.xcodeproj`/scheme into isolated DerivedData and launches that exact product, using `MACOSX_DEPLOYMENT_TARGET=13.0` only as a command-line diagnostic override. Its syntax was checked with `bash -n`. The permanent project deployment target remains 11.0.
+
+The stale UI seen when pressing ⌘R is **not diagnosed conclusively**. Explicit project/scheme settings point `SRCROOT`/`PROJECT_DIR` to this worktree, but the active Xcode window/run executable and any competing original-app process could not be verified. The Mac was locked during the UI attempt; the script itself was not used as proof of interactive acceptance. No new manual Notes-library test was performed.
+
+### Validation evidence and open failures
+
+| Check | Outcome | Evidence |
+|---|---|---|
+| Focused PDF/renderer regressions | **PASS — 14 passed, 0 failed, 0 skipped** | `/private/tmp/apple-notes-exporter-p3-focused-r1-20261025.xcresult`; includes synthetic PDF page composition/order/geometry/visible-content checks, limits and error paths, WebKit isolation, pending-print cancellation, and Faithful/Study render checks. |
+| Complete app/unit target | **PARTIAL — 195 passed, 1 failed, 0 skipped** | `/private/tmp/apple-notes-exporter-p3-unit-final-20261025.xcresult`; the app/test code compiled. Sole failure: `test_zipDirectory_preservesFileModificationDates`, expected `1400000000`, observed `1400003600` (a +3600-second difference). No production ZIP code was changed in P3. |
+| ZIP timestamp rerun with `TZ=UTC` | **FAIL — same assertion** | `/private/tmp/apple-notes-exporter-p3-unit-r2-20261025.xcresult` records 194 passed and the same one failed (195 total). Treat the timezone/DST explanation as a hypothesis, not a proven root cause. |
+| UI test | **NOT VERIFIED** | `/private/tmp/apple-notes-exporter-p3-ui-20261025.xcresult`; test worker did not establish a connection and the attempt was interrupted after about 150 seconds. No UI test is counted as passed. |
+| Isolated app build | **PASS** | Explicit project build succeeded in the preceding validation; the final app/unit run also compiled the current app sources. The final one-line PDF byte-accounting change was included in the app/unit run. |
+| Script and diff hygiene | **PASS** | `bash -n scripts/run-integration-app.sh`; `git diff --check`. |
+| Faithful/Study visual preview | **SYNTHETIC PREVIEW INSPECTED** | Rendered PDF page previews from the test result were inspected. This is not a live UI or real-Notes acceptance test. |
+
+The default build without the command-line override is blocked by the installed Xcode/macOS SDK rejecting the unchanged deployment target 11.0 (the SDK reports a supported range starting at 12.0). No permanent target change was made. F2/P2.2-E—whether Apple Notes' serialized Monostile data reliably distinguishes internal newlines from consecutive block boundaries—remains open and is not resolved by these P3 changes.
+
+### P3 changed files
+
+- `Apple Notes Exporter/Apple Notes Exporter/AppleNotesExporterApp.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ExportSupport.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/HTMLAttachmentProcessor.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/NoteSelectorView.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/Repository/NotesRepository.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ViewModels/ExportViewModel.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
+- `Apple Notes Exporter/Apple Notes ExporterUITests/Apple_Notes_ExporterUITests.swift`
+- `scripts/run-integration-app.sh`
+- `docs/notes-to-pdf/ARCHITECTURE.md`
+- `docs/notes-to-pdf/README.md`
+- `docs/notes-to-pdf/INTEGRATION_REPORT.md`
+
+No real-note data or personal notes were added to tests, fixtures, or documentation.

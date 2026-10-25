@@ -27,6 +27,8 @@ struct AttachmentMarkerFallbackResult {
     let html: String
     let incompleteAttachmentIDs: Set<String>
     let diagnostics: [String]
+    let embeddedPDFInsertions: [PDFHTMLAttachmentInsertion]
+    let unplaceablePDFAttachmentIDs: Set<String>
 }
 
 /// Processes HTML to replace attachment placeholders with inline content or links
@@ -42,6 +44,9 @@ class HTMLAttachmentProcessor {
     /// Informational notes that clarify external references without counting
     /// them as failed attachment preservation.
     private(set) var notices: [String] = []
+    private(set) var embeddedPDFInsertions: [PDFHTMLAttachmentInsertion] = []
+    private(set) var unplaceablePDFAttachmentIDs: Set<String> = []
+    private var verifiedPDFDataByID: [String: Data] = [:]
 
     init(database: OpaquePointer) {
         self.db = database
@@ -62,11 +67,12 @@ class HTMLAttachmentProcessor {
     static func replaceUnavailableMarkersWithoutDatabase(
         in html: String,
         attachments: [NotesAttachment],
-        reason: String
+        reason: String,
+        verifiedPDFDataByID: [String: Data] = [:]
     ) -> AttachmentMarkerFallbackResult {
         let pattern = #"<span\s+data-attachment-id="([^"]+)"\s+data-attachment-type="([^"]+)">.*?</span>"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
-            return AttachmentMarkerFallbackResult(html: html, incompleteAttachmentIDs: [], diagnostics: [])
+            return AttachmentMarkerFallbackResult(html: html, incompleteAttachmentIDs: [], diagnostics: [], embeddedPDFInsertions: [], unplaceablePDFAttachmentIDs: [])
         }
         let source = html as NSString
         let matches = regex.matches(in: html, range: NSRange(location: 0, length: source.length))
@@ -79,6 +85,8 @@ class HTMLAttachmentProcessor {
         var result = html
         var incompleteIDs = Set<String>()
         var diagnostics: [String] = []
+        var embeddedPDFInsertions: [PDFHTMLAttachmentInsertion] = []
+        var unplaceablePDFIDs = Set<String>()
 
         for match in matches.reversed() where match.numberOfRanges >= 3 {
             let fullRange = match.range(at: 0)
@@ -87,6 +95,14 @@ class HTMLAttachmentProcessor {
             let attachment = attachmentMap[identifier]
             let label = attachment?.filename ?? attachment?.name ?? "Attachment \(identifier)"
             let isUnverified = attachment == nil
+            let typeIsPDF = isPDFType(typeUTI) || attachment.map { isPDFType($0.typeUTI) } == true
+            if typeIsPDF, attachment != nil, let data = verifiedPDFDataByID[identifier] {
+                let insertion = PDFHTMLAttachmentInsertion(attachmentID: identifier, filename: label, data: data)
+                embeddedPDFInsertions.append(insertion)
+                result = (result as NSString).replacingCharacters(in: fullRange, with: insertion.markerHTML)
+                continue
+            }
+            if typeIsPDF { unplaceablePDFIDs.insert(identifier) }
             let detail = isUnverified
                 ? "Ownership could not be verified; original content was not accessed"
                 : "The source database was unavailable; original content was not accessed"
@@ -105,8 +121,14 @@ class HTMLAttachmentProcessor {
         return AttachmentMarkerFallbackResult(
             html: result,
             incompleteAttachmentIDs: incompleteIDs,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            embeddedPDFInsertions: embeddedPDFInsertions,
+            unplaceablePDFAttachmentIDs: unplaceablePDFIDs
         )
+    }
+
+    static func isPDFType(_ typeUTI: String) -> Bool {
+        typeUTI == "com.adobe.pdf" || typeUTI == "public.pdf"
     }
 
     static func isInlineImageType(_ typeUTI: String) -> Bool {
@@ -138,16 +160,25 @@ class HTMLAttachmentProcessor {
         exportDirectory: String? = nil,
         embedImages: Bool,
         linkEmbeddedImages: Bool,
-        standalonePDF: Bool = false
+        standalonePDF: Bool = false,
+        verifiedPDFDataByID: [String: Data] = [:]
     ) -> String {
         // Store export directory for later use
         self.exportDirectory = exportDirectory
+        self.verifiedPDFDataByID = verifiedPDFDataByID
+        self.embeddedPDFInsertions.removeAll()
+        self.unplaceablePDFAttachmentIDs.removeAll()
+        self.incompleteAttachmentIDs.removeAll()
+        self.diagnostics.removeAll()
+        self.notices.removeAll()
 
         var processedHTML = html
 
         // Create attachment lookup by ID
         var attachmentMap: [String: NotesAttachment] = [:]
-        for attachment in attachments {
+        for attachment in attachments where attachmentMap[attachment.id] == nil {
+            // Keep the first metadata row deterministically when damaged stores
+            // contain duplicate IDs; dictionary construction must never trap.
             attachmentMap[attachment.id] = attachment
         }
 
@@ -170,6 +201,9 @@ class HTMLAttachmentProcessor {
             let represented = representedAttachmentIDs(in: html)
             for attachment in attachments where !represented.contains(attachment.id) {
                 markIncomplete(attachment, reason: "it has no inline marker in the note HTML")
+                if Self.isPDFType(attachment.typeUTI) {
+                    unplaceablePDFAttachmentIDs.insert(attachment.id)
+                }
             }
         }
 
@@ -293,12 +327,22 @@ class HTMLAttachmentProcessor {
         }
 
         // Check if this is a PDF
-        if attachment.typeUTI == "com.adobe.pdf" || attachment.typeUTI == "public.pdf" {
+        if Self.isPDFType(attachment.typeUTI) {
             if standalonePDF {
-                markIncomplete(attachment, reason: "the original PDF file is not embedded")
+                if let data = verifiedPDFDataByID[uuid] {
+                    let insertion = PDFHTMLAttachmentInsertion(
+                        attachmentID: uuid,
+                        filename: attachment.filename ?? "PDF document",
+                        data: data
+                    )
+                    embeddedPDFInsertions.append(insertion)
+                    return insertion.markerHTML
+                }
+                markIncomplete(attachment, reason: "owner-verified PDF bytes were not available")
+                unplaceablePDFAttachmentIDs.insert(attachment.id)
                 return Self.standaloneFileReferenceHTML(
                     filename: attachment.filename ?? "PDF document",
-                    description: "Original PDF file not embedded in this PDF"
+                    description: "Original PDF pages could not be placed in this PDF"
                 )
             }
             return generatePDFLinkHTML(attachment: attachment, relativePath: relativePath)

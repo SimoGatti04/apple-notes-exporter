@@ -37,6 +37,8 @@ protocol NotesRepository {
 
     /// Fetch binary data for a specific attachment
     func fetchAttachment(id: String) async throws -> Data
+    /// Fetch only after confirming that the attachment belongs to this note.
+    func fetchAttachment(id: String, ownedByNoteID noteID: String) async throws -> Data
 
     /// Fetch filename for a specific attachment
     func fetchAttachmentFilename(id: String) async -> String?
@@ -58,6 +60,12 @@ extension NotesRepository {
     func fetchNotes() async throws -> [NotesNote] {
         try await fetchNotes(includeDeleted: false)
     }
+
+    /// Custom repositories must opt in to ownership verification. The safe
+    /// default fails closed rather than fetching bytes by an unscoped ID.
+    func fetchAttachment(id: String, ownedByNoteID noteID: String) async throws -> Data {
+        throw RepositoryError.attachmentOwnershipUnverified(id)
+    }
 }
 
 // MARK: - Gallery Child
@@ -75,6 +83,7 @@ enum RepositoryError: Error, LocalizedError {
     case databaseUnavailable
     case itemNotFound(String)
     case attachmentNotFound(String)
+    case attachmentOwnershipUnverified(String)
     case decodingError(String)
 
     var errorDescription: String? {
@@ -85,6 +94,8 @@ enum RepositoryError: Error, LocalizedError {
             return "Item with ID '\(id)' was not found in the database."
         case .attachmentNotFound(let id):
             return "Attachment '\(id)' was not found or could not be retrieved."
+        case .attachmentOwnershipUnverified(let id):
+            return "Ownership of attachment '\(id)' could not be verified for this note."
         case .decodingError(let details):
             return "Failed to decode data from database: \(details)"
         }
@@ -357,6 +368,35 @@ class DatabaseNotesRepository: NotesRepository, @unchecked Sendable {
                 } else {
                     continuation.resume(throwing: RepositoryError.attachmentNotFound(id))
                 }
+            }
+        }
+    }
+
+    func fetchAttachment(id: String, ownedByNoteID noteID: String) async throws -> Data {
+        guard let notePrimaryKey = Int64(noteID) else {
+            throw RepositoryError.attachmentOwnershipUnverified(id)
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            self.dbQueue.async {
+                guard let db = self.openDB() else {
+                    continuation.resume(throwing: RepositoryError.databaseUnavailable)
+                    return
+                }
+                let isOwned = id.withCString { ane_validate_attachment_owner(db, $0, notePrimaryKey) != 0 }
+                guard isOwned else {
+                    continuation.resume(throwing: RepositoryError.attachmentOwnershipUnverified(id))
+                    return
+                }
+                guard let result = id.withCString({ ane_fetch_attachment(db, $0, nil) }) else {
+                    continuation.resume(throwing: RepositoryError.attachmentNotFound(id))
+                    return
+                }
+                defer { ane_free_attachment_data(result) }
+                guard let bytes = result.pointee.data, result.pointee.len > 0 else {
+                    continuation.resume(throwing: RepositoryError.attachmentNotFound(id))
+                    return
+                }
+                continuation.resume(returning: Data(bytes: bytes, count: result.pointee.len))
             }
         }
     }

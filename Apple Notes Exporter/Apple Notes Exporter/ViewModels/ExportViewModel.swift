@@ -33,6 +33,7 @@ enum ExportError: Error, LocalizedError {
     case tooManyPDFNameCollisions
     case pdfNavigationFailed(String)
     case invalidGeneratedPDF
+    case pdfAttachmentCouldNotBePlaced(String)
     case pdfPrintFailed(String)
 
     var errorDescription: String? {
@@ -47,6 +48,8 @@ enum ExportError: Error, LocalizedError {
             return "Could not load note content for PDF rendering: \(message)"
         case .invalidGeneratedPDF:
             return "The PDF renderer produced an invalid or empty document."
+        case .pdfAttachmentCouldNotBePlaced(let name):
+            return "PDF attachment '\(name)' could not be placed safely; no incomplete export was written."
         case .pdfPrintFailed(let message):
             return "AppKit could not finish PDF printing: \(message)"
         }
@@ -268,6 +271,9 @@ class ExportViewModel: ObservableObject {
     /// flat-PDF export. The IDs let multiple diagnostics for one attachment be
     /// reported without inflating the final partial-failure count.
     private var flatPDFIncompleteAttachmentIDs: Set<String> = []
+    private var flatPDFUnplaceableAttachmentIDs: Set<String> = []
+    private var flatPDFVerifiedDataByID: [String: Data] = [:]
+    private var flatPDFInsertions: [PDFHTMLAttachmentInsertion] = []
 
     /// WebViews currently owned by structured PDF rendering tasks. Cancellation
     /// and timeout watchers stop navigation, while the task group still waits
@@ -639,6 +645,9 @@ class ExportViewModel: ObservableObject {
         failedNotesCount = 0
         failedAttachmentsCount = 0
         flatPDFIncompleteAttachmentIDs = []
+        flatPDFUnplaceableAttachmentIDs = []
+        flatPDFVerifiedDataByID = [:]
+        flatPDFInsertions = []
         internalLinkMap = [:]
         lastExportArtifactURL = nil
         exportState = .exporting(ExportProgress(current: 0, total: 1, message: "Preparing PDF..."))
@@ -653,6 +662,8 @@ class ExportViewModel: ObservableObject {
                 }
             }
             internalLinkMap = [:]
+            flatPDFVerifiedDataByID = [:]
+            flatPDFInsertions = []
         }
 
         do {
@@ -669,6 +680,32 @@ class ExportViewModel: ObservableObject {
             let staging = try Self.createFlatPDFStagingDirectory()
             stagingDirectory = staging
             log("Staging this single-note PDF in a private temporary directory")
+
+            var uniquePDFAttachments: [NotesAttachment] = []
+            var seenPDFAttachmentIDs = Set<String>()
+            for attachment in note.attachments where HTMLAttachmentProcessor.isPDFType(attachment.typeUTI) {
+                if seenPDFAttachmentIDs.insert(attachment.id).inserted {
+                    uniquePDFAttachments.append(attachment)
+                }
+            }
+            var totalPDFBytes = 0
+            var totalPDFPages = 0
+            for attachment in uniquePDFAttachments {
+                try Task.checkCancellation()
+                if shouldCancel { throw CancellationError() }
+                let name = attachment.filename ?? attachment.name
+                let data = try await repository.fetchAttachment(id: attachment.id, ownedByNoteID: note.id)
+                let document = try PDFHTMLSequenceComposer.validatedAttachmentDocument(
+                    from: data,
+                    filename: name,
+                    alreadyIncludedBytes: totalPDFBytes,
+                    alreadyIncludedPages: totalPDFPages
+                )
+                totalPDFBytes += data.count
+                totalPDFPages += document.pageCount
+                flatPDFVerifiedDataByID[attachment.id] = data
+                log("Verified PDF attachment ‘\(name)’ (\(document.pageCount) page(s)) for this note")
+            }
 
             var attachmentPaths: [String: String] = [:]
             let inlineImageAttachments = note.attachments.filter {
@@ -722,16 +759,31 @@ class ExportViewModel: ObservableObject {
                 standalonePDF: true
             )
 
+            if let unplaceableID = flatPDFUnplaceableAttachmentIDs.first {
+                let name = note.attachments.first(where: { $0.id == unplaceableID })?.filename ?? unplaceableID
+                throw ExportError.pdfAttachmentCouldNotBePlaced(name)
+            }
+
             let stagedPDF = staging.appendingPathComponent("rendered.pdf")
             let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
-            let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
             log("Rendering standalone PDF...")
-            try await renderPDFHTML(
-                paginatedHTML,
-                to: stagedPDF,
-                pageSize: pageSizeCG,
-                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-            )
+            if flatPDFInsertions.isEmpty {
+                let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
+                try await renderPDFHTML(
+                    paginatedHTML,
+                    to: stagedPDF,
+                    pageSize: pageSizeCG,
+                    margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+                )
+            } else {
+                try await renderPDFHTMLSequence(
+                    html,
+                    insertions: flatPDFInsertions,
+                    to: stagedPDF,
+                    stagingDirectory: staging,
+                    pageSize: pageSizeCG
+                )
+            }
 
             try Task.checkCancellation()
             if shouldCancel { throw CancellationError() }
@@ -792,6 +844,56 @@ class ExportViewModel: ObservableObject {
     /// output files. If WebKit is unresponsive during PDF capture, cancellation
     /// may take until WebKit completes; we deliberately do not return while it
     /// can still be rendering.
+    private func renderPDFHTMLSequence(
+        _ html: String,
+        insertions: [PDFHTMLAttachmentInsertion],
+        to outputURL: URL,
+        stagingDirectory: URL,
+        pageSize: CGSize
+    ) async throws {
+        let parts = try PDFHTMLSequenceComposer.parts(html: html, insertions: insertions)
+        var documents: [PDFDocument] = []
+        var insertedPDFBytes = 0
+        var insertedPageCount = 0
+
+        for (index, part) in parts.enumerated() {
+            try Task.checkCancellation()
+            if shouldCancel { throw CancellationError() }
+            switch part {
+            case .html(let fragment):
+                let segmentURL = stagingDirectory.appendingPathComponent("rendered-segment-\(index).pdf")
+                let paginated = pdfHTMLWithPageGeometry(fragment, pageSize: pageSize)
+                try await renderPDFHTML(
+                    paginated,
+                    to: segmentURL,
+                    pageSize: pageSize,
+                    margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+                )
+                guard let document = PDFDocument(url: segmentURL), document.pageCount > 0 else {
+                    throw ExportError.invalidGeneratedPDF
+                }
+                documents.append(document)
+
+            case .attachment(let insertion):
+                let source = try PDFHTMLSequenceComposer.validatedAttachmentDocument(
+                    from: insertion.data,
+                    filename: insertion.filename,
+                    alreadyIncludedBytes: insertedPDFBytes,
+                    alreadyIncludedPages: insertedPageCount
+                )
+                insertedPDFBytes += insertion.data.count
+                insertedPageCount += source.pageCount
+                documents.append(source)
+            }
+        }
+
+        guard !documents.isEmpty else { throw ExportError.invalidGeneratedPDF }
+        try PDFHTMLSequenceComposer.write(documents: documents, to: outputURL) {
+            try Task.checkCancellation()
+            if self.shouldCancel { throw CancellationError() }
+        }
+    }
+
     private func renderPDFHTML(
         _ html: String,
         to url: URL,
@@ -1644,10 +1746,13 @@ class ExportViewModel: ObservableObject {
                         exportDirectory: exportDirectory?.path,
                         embedImages: htmlConfig.embedImagesInline,
                         linkEmbeddedImages: htmlConfig.linkEmbeddedImages,
-                        standalonePDF: standalonePDF
+                        standalonePDF: standalonePDF,
+                        verifiedPDFDataByID: standalonePDF ? flatPDFVerifiedDataByID : [:]
                     )
                     if standalonePDF {
                         flatPDFIncompleteAttachmentIDs.formUnion(processor.incompleteAttachmentIDs)
+                        flatPDFUnplaceableAttachmentIDs.formUnion(processor.unplaceablePDFAttachmentIDs)
+                        flatPDFInsertions.append(contentsOf: processor.embeddedPDFInsertions)
                         for diagnostic in processor.diagnostics {
                             log("⚠︎ \(diagnostic)")
                         }
@@ -1659,14 +1764,16 @@ class ExportViewModel: ObservableObject {
                     processedHTML = replaceUnavailablePDFAttachmentMarkers(
                         in: linkRewrittenBody,
                         attachments: note.attachments,
-                        reason: "The Notes database attachment handle was unavailable"
+                        reason: "The Notes database attachment handle was unavailable",
+                        verifiedPDFDataByID: flatPDFVerifiedDataByID
                     )
                 }
             } else if standalonePDF {
                 processedHTML = replaceUnavailablePDFAttachmentMarkers(
                     in: linkRewrittenBody,
                     attachments: note.attachments,
-                    reason: "The Notes database could not be opened to verify attachment data"
+                    reason: "The Notes database could not be opened to verify attachment data",
+                    verifiedPDFDataByID: flatPDFVerifiedDataByID
                 )
             }
         }
@@ -1720,6 +1827,9 @@ class ExportViewModel: ObservableObject {
 
     private func recordFlatPDFAttachmentFailure(_ attachments: [NotesAttachment], reason: String) {
         flatPDFIncompleteAttachmentIDs.formUnion(attachments.map(\.id))
+        for attachment in attachments where HTMLAttachmentProcessor.isPDFType(attachment.typeUTI) {
+            flatPDFUnplaceableAttachmentIDs.insert(attachment.id)
+        }
         for attachment in attachments {
             let label = attachment.filename ?? attachment.id
             log("⚠︎ Attachment '\(label)' was not verified for the PDF: \(reason).")
@@ -1729,22 +1839,28 @@ class ExportViewModel: ObservableObject {
     private func replaceUnavailablePDFAttachmentMarkers(
         in html: String,
         attachments: [NotesAttachment],
-        reason: String
+        reason: String,
+        verifiedPDFDataByID: [String: Data]
     ) -> String {
         let fallback = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
             in: html,
             attachments: attachments,
-            reason: reason
+            reason: reason,
+            verifiedPDFDataByID: verifiedPDFDataByID
         )
         flatPDFIncompleteAttachmentIDs.formUnion(fallback.incompleteAttachmentIDs)
+        flatPDFUnplaceableAttachmentIDs.formUnion(fallback.unplaceablePDFAttachmentIDs)
+        flatPDFInsertions.append(contentsOf: fallback.embeddedPDFInsertions)
         for diagnostic in fallback.diagnostics {
             log("⚠︎ \(diagnostic)")
         }
 
         // Preserve reporting for attachments without inline markers while
         // avoiding duplicate warnings for markers replaced by the fallback.
+        let fallbackRepresentedPDFIDs = Set(fallback.embeddedPDFInsertions.map(\.attachmentID))
         let unrepresentedAttachments = attachments.filter {
             !fallback.incompleteAttachmentIDs.contains($0.id)
+                && !fallbackRepresentedPDFIDs.contains($0.id)
         }
         recordFlatPDFAttachmentFailure(unrepresentedAttachments, reason: reason)
         return fallback.html

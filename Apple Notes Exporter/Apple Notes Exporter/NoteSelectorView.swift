@@ -28,6 +28,7 @@ struct NoteSelectorView: View {
     @State private var searchText = ""
     @FocusState private var searchFieldFocused: Bool
     @State private var selectedScope: NoteBrowserScope = .allNotes
+    @State private var focusedNoteID: String?
 
     private var normalizedQuery: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -38,18 +39,6 @@ struct NoteSelectorView: View {
         // need to navigate the hierarchy just to find a note by title.
         let candidates = normalizedQuery.isEmpty ? viewModel.notes(in: selectedScope) : viewModel.allNotes
         return NotesViewModel.filterNotes(candidates, matchingTitle: normalizedQuery)
-    }
-
-    private var visibleIDs: Set<String> { Set(visibleNotes.map(\.id)) }
-
-    private var listSelection: Binding<Set<String>> {
-        Binding(
-            get: { viewModel.selectedNoteIDs.intersection(visibleIDs) },
-            set: { selectedIDs in
-                viewModel.updateVisibleSelection(selectedIDs, visibleIDs: visibleIDs)
-                sharedState.update()
-            }
-        )
     }
 
     private var scopeHeading: String {
@@ -66,7 +55,7 @@ struct NoteSelectorView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Choose notes")
                         .font(.title2.weight(.semibold))
-                    Text("Search by title or browse an account. Select one note or use ⌘-click for multiple notes.")
+                    Text("Search by title or browse an account. Check notes for export; highlighting a row is only for navigation.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
@@ -89,6 +78,7 @@ struct NoteSelectorView: View {
                 Label("\(viewModel.selectedCount) selected", systemImage: "checkmark.circle.fill")
                     .foregroundColor(viewModel.selectedCount == 0 ? .secondary : .accentColor)
                     .accessibilityLabel("\(viewModel.selectedCount) notes selected")
+                    .accessibilityIdentifier("selected-note-count")
                 Spacer()
                 Button("Clear selection") {
                     viewModel.clearSelections()
@@ -123,7 +113,8 @@ struct NoteSelectorView: View {
                     SelectionMarkButton(
                         title: "all notes",
                         status: aggregateSelectionStatus,
-                        isEnabled: !viewModel.allNotes.isEmpty
+                        isEnabled: !viewModel.allNotes.isEmpty,
+                        identifier: "all-notes-selection"
                     ) {
                         viewModel.toggleNotes(viewModel.allNotes.map(\.id))
                         sharedState.update()
@@ -249,10 +240,19 @@ struct NoteSelectorView: View {
                     }
                 )
             } else {
-                SwiftUI.List(selection: listSelection) {
+                SwiftUI.List {
                     ForEach(visibleNotes) { note in
-                        NoteSelectionRow(note: note, location: viewModel.locationDescription(for: note))
-                            .tag(note.id)
+                        NoteSelectionRow(
+                            note: note,
+                            location: viewModel.locationDescription(for: note),
+                            isSelected: viewModel.selectedNoteIDs.contains(note.id),
+                            isFocused: focusedNoteID == note.id,
+                            onFocus: { focusedNoteID = note.id },
+                            onToggleSelection: {
+                                viewModel.toggleNote(note.id)
+                                sharedState.update()
+                            }
+                        )
                     }
                 }
                 .listStyle(InsetListStyle())
@@ -292,6 +292,7 @@ private struct AccountBrowserSection: View {
                     title: "all notes in \(accountNode.account.name)",
                     status: viewModel.selectionStatus(for: accountNotes.map(\.id)),
                     isEnabled: !accountNotes.isEmpty,
+                    identifier: "account-selection-\(accountNode.account.id)",
                     action: {
                         viewModel.toggleNotes(accountNotes.map(\.id))
                         onSelectionChange()
@@ -340,6 +341,7 @@ private struct FolderBrowserRow: View {
                     title: "all notes in \(folderNode.folder.name)",
                     status: viewModel.selectionStatus(for: folderNode),
                     isEnabled: !folderNotes.isEmpty,
+                    identifier: "folder-selection-\(folderNode.folder.id)",
                     action: {
                         viewModel.toggleFolder(folderNode)
                         onSelectionChange()
@@ -401,6 +403,7 @@ private struct SelectionMarkButton: View {
     let title: String
     let status: NoteSelectionStatus
     var isEnabled: Bool = true
+    var identifier: String? = nil
     let action: () -> Void
 
     private var symbol: String {
@@ -430,6 +433,7 @@ private struct SelectionMarkButton: View {
         .opacity(isEnabled ? 1 : 0.45)
         .foregroundColor(status == .none ? .secondary : .accentColor)
         .accessibilityLabel("Select or deselect \(title)")
+        .accessibilityIdentifier(identifier ?? "selection-mark-\(title)")
         .accessibilityValue(isEnabled ? statusDescription : "No notes")
         .help(isEnabled ? "\(statusDescription.capitalized): \(title)" : "No notes in this location")
     }
@@ -438,35 +442,68 @@ private struct SelectionMarkButton: View {
 private struct NoteSelectionRow: View {
     let note: NotesNote
     let location: String
+    let isSelected: Bool
+    let isFocused: Bool
+    let onFocus: () -> Void
+    let onToggleSelection: () -> Void
 
     private var displayTitle: String { note.title.isEmpty ? "Untitled Note" : note.title }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: note.icon)
-                .foregroundColor(.secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(displayTitle)
-                    .font(.body)
-                    .lineLimit(1)
-                Text(location)
+        HStack(spacing: 10) {
+            Button(action: onToggleSelection) {
+                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundColor(isSelected ? .accentColor : .secondary)
+                    .frame(width: 28, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(BorderlessButtonStyle())
+            .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(displayTitle) for export")
+            .accessibilityValue(isSelected ? "Selected" : "Not selected")
+            .accessibilityIdentifier("note-selection-\(note.id)")
+            .help(isSelected ? "Selected for export" : "Select this note for export")
+
+            Button(action: onFocus) {
+                HStack(spacing: 12) {
+                    Image(systemName: note.icon)
+                        .foregroundColor(.secondary)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(displayTitle)
+                            .font(.body)
+                            .lineLimit(1)
+                        Text(location)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(note.modificationDate, style: .date)
+                        Text(note.modificationDate, style: .time)
+                    }
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 5)
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(note.modificationDate, style: .date)
-                Text(note.modificationDate, style: .time)
-            }
-            .font(.caption)
-            .foregroundColor(.secondary)
-            .lineLimit(1)
+            .buttonStyle(PlainButtonStyle())
+            .accessibilityIdentifier("note-row-\(note.id)")
+            .accessibilityLabel("\(displayTitle), \(location), modified \(note.modificationDate.formatted(date: .abbreviated, time: .shortened))")
+            .accessibilityValue(isFocused ? "Focused for navigation" : "Not focused")
         }
-        .padding(.vertical, 3)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(displayTitle), \(location), modified \(note.modificationDate.formatted(date: .abbreviated, time: .shortened))")
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isFocused ? SwiftUI.Color.accentColor.opacity(0.12) : .clear)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(isFocused ? SwiftUI.Color.accentColor.opacity(0.45) : .clear, lineWidth: 1)
+        }
     }
 }
 

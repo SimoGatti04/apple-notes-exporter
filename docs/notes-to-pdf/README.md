@@ -1,13 +1,14 @@
 # Notes to PDF — project brief
 
-Status: **P2 integration complete — READY WITH LIMITATIONS** on local branch `codex/notes-pdf-integration`; not pushed, merged to `main`, released, or distributed. The tested application snapshot is `d618d785b5a9d45e0dc1eb85f1af20913a6fab88`. See [the P2 integration and validation report](INTEGRATION_REPORT.md) for evidence and known limits. Fork of [kzaremski/apple-notes-exporter](https://github.com/kzaremski/apple-notes-exporter), GPL-3.0-or-later. Base inspected: `baa676108c8baa427450d624ffad4c41884eaeb9` (2026-10-22).
+Status: **P3 implementation checkpoint — READY WITH LIMITATIONS** on local branch `codex/notes-pdf-integration`; not pushed, merged to `main`, released, or distributed. See [the integration and validation report](INTEGRATION_REPORT.md) for the P2/P2.1/P3 evidence and remaining gates. Fork of [kzaremski/apple-notes-exporter](https://github.com/kzaremski/apple-notes-exporter), GPL-3.0-or-later. Base inspected: `baa676108c8baa427450d624ffad4c41884eaeb9` (2026-10-22).
 
 ## Current implementation checkpoint
-- One selected note can be exported as one flat, non-overwriting PDF in the chosen folder. **Study** is the default; **Faithful** is selectable and persisted. Older saved configurations decode with Study as the default.
-- Multiple selected notes produce individual PDFs through the existing multi-note output planner; they are not merged into one PDF.
-- The app PDF route uses the Notes-aware parser output and PDF styling renderer. CLI/MCP and other existing format paths were kept outside this UI-only integration change.
-- Supported inline image content is rendered into the standalone PDF where available. Unavailable images and unsupported file/gallery content are reported as incomplete rather than linked to temporary staging paths.
-- Automated app/unit tests and synthetic visual PDF checks pass. The UI-test runner failed during bootstrap, and no interactive UI acceptance test or real-Apple-Notes validation was performed; therefore this is not a release-complete claim.
+- One or more selected notes can be exported as separate, flat, non-overwriting PDFs in the chosen folder; the files are not merged. The note checklist selection is independent from row focus and is retained by note identity while browsing/searching.
+- **Study** is the default PDF profile; **Faithful** is selectable and persisted. Older saved configurations decode with Study as the default.
+- The app PDF route uses the Notes-aware parser and PDF styling renderer. Verified PDF attachments are inserted as native PDF pages at their note markers, preserving page sequence and geometry instead of rasterizing the source pages. Per-file/aggregate byte and page limits apply; missing, corrupt, or unplaceable PDFs fail closed rather than silently producing a partial export. The original PDF is not separately embedded as an attachment file in the output.
+- Supported inline image content is rendered into the standalone PDF where available. Other unsupported file/gallery content is still reported as incomplete rather than linked to temporary staging paths. CLI/MCP and other existing format paths remain outside this app UI integration.
+- The explicit-project launcher is `scripts/run-integration-app.sh`; it uses isolated DerivedData and a command-line macOS 13.0 diagnostic override without changing the permanent deployment target. The cause of the stale UI from Xcode's ⌘R has not been established.
+- Synthetic app/unit validation includes 14 focused regressions passing; the complete app/unit run had 195 passes and one ZIP modification-time failure. The UI-test runner did not bootstrap, and no interactive UI or real-library Apple Notes acceptance was completed. This is not a release-complete claim; Monostile block-boundary reconstruction (F2/P2.2-E) remains open.
 
 ## Goal
 An entirely local macOS SwiftUI app to select one or more Apple Notes without manually exporting Markdown, and produce legible, portable, attractive PDF documents. Preserve all original text and meaningful formatting, inline images/tables, attachments and supported links; never mutate the original Apple Notes library.
