@@ -303,6 +303,23 @@ final class EngineParityTests: XCTestCase {
 
     // MARK: - Tests
 
+    func test_pdfPreviewUsesStandaloneRendererWithoutChangingExportState() async throws {
+        let db = try makeFixtureDatabase()
+        let viewModel = ExportViewModel(
+            repository: DatabaseNotesRepository(databasePath: db), databasePath: db
+        )
+        var configurations = ExportConfigurations.default
+        configurations.pdf.styleProfile = .study
+        viewModel.configurations = configurations
+
+        let data = try await viewModel.generatePDFPreviewData(for: makeNote())
+        let document = try XCTUnwrap(PDFDocument(data: data))
+
+        XCTAssertGreaterThan(document.pageCount, 0)
+        XCTAssertEqual(viewModel.exportState, .idle)
+        XCTAssertNil(viewModel.lastExportArtifactURL)
+    }
+
     func test_singleNotePDFWritesFlatAndRemovesStagingDirectory() async throws {
         let db = try makeFixtureDatabase()
         let output = try makeOutputDirectory()

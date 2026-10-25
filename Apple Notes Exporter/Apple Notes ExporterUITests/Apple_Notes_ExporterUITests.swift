@@ -35,6 +35,48 @@ final class Apple_Notes_ExporterUITests: XCTestCase {
         // Put teardown code here. This method is called after the invocation of each test method in the class.
     }
 
+    func testMainExporterControlsAndPDFPreviewUseSyntheticNotes() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-testing", "--ui-testing-exporter-main"]
+        app.launch()
+
+        let chooseNotes = app.buttons["noteSelectionButton"]
+        XCTAssertTrue(chooseNotes.waitForExistence(timeout: 10))
+        chooseNotes.click()
+
+        let alphaSelection = app.buttons["note-selection-fixture-note-alpha"]
+        XCTAssertTrue(alphaSelection.waitForExistence(timeout: 5))
+        alphaSelection.click()
+        app.buttons["Done"].click()
+
+        let studyStyle = app.buttons["pdfStyleStudy"]
+        XCTAssertTrue(studyStyle.waitForExistence(timeout: 5))
+        studyStyle.click()
+        XCTAssertEqual(studyStyle.value as? String, "Selezionato")
+
+        let embedOnly = app.buttons["pdfAttachmentOnly"]
+        XCTAssertTrue(embedOnly.exists)
+        embedOnly.click()
+        XCTAssertEqual(embedOnly.value as? String, "Selezionato")
+
+        app.buttons["previewButton"].click()
+        XCTAssertTrue(app.buttons["Chiudi"].waitForExistence(timeout: 5))
+
+        let previewDocument = app.descendants(matching: .any)["pdfPreviewDocument"]
+        XCTAssertTrue(previewDocument.waitForExistence(timeout: 20))
+
+        let stylePicker = app.segmentedControls["previewStylePicker"]
+        XCTAssertTrue(stylePicker.exists)
+        stylePicker.buttons["Originale"].click()
+
+        let status = app.descendants(matching: .any)["pdfPreviewStatus"]
+        let refreshed = NSPredicate(format: "label == %@", "Aggiornamento automatico")
+        expectation(for: refreshed, evaluatedWith: status)
+        waitForExpectations(timeout: 20)
+
+        app.buttons["Chiudi"].click()
+    }
+
     func testNoteSelectionIsIndependentAndSurvivesSearchAndFolderScopes() throws {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-testing"]

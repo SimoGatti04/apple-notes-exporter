@@ -19,6 +19,8 @@
 //
 
 import AppKit
+import Combine
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 import Foundation
@@ -282,18 +284,19 @@ struct AppleNotesExporterView: View {
     // Show license/permissions view on first launch OR when Full Disk Access has been
     // revoked since the last launch (e.g. user toggled it off in System Settings).
     @State private var showLicensePermissionsView: Bool = {
+        if ProcessInfo.processInfo.arguments.contains("--ui-testing-exporter-main") {
+            return false
+        }
         let licenseAccepted = UserDefaults.standard.bool(forKey: "licenseAcceptedGPLv3")
         return !licenseAccepted || !hasNotesDatabaseAccess()
     }()
     @State private var showNoteSelectorView: Bool = false
     @State private var showFormatOptionsView: Bool = false
+    @State private var showAdvancedOutputOptionsView: Bool = false
+    @State private var showPDFPreview: Bool = false
     @State private var showMCPSetupView: Bool = false
-    @State private var showProgressWindow: Bool = false
-    @State private var showErrorExportingAlert: Bool = false
     @State private var showAlert: Bool = false
     @State private var activeAlert: ActiveAlert = .noneSelected
-    @State private var showConfigurePopover: Bool = false
-    @State private var showAdvancedOutputOptions: Bool = false
     @State private var showSyncWarning: Bool = false
     @State private var now: Date = Date()
     private let syncTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -326,164 +329,185 @@ struct AppleNotesExporterView: View {
     }
 
     private var notesCard: some View {
-        GroupBox {
-            HStack(spacing: 14) {
-                Image(systemName: "checklist")
-                    .font(.system(size: 25, weight: .medium))
-                    .foregroundColor(.accentColor)
-                    .frame(width: 42, height: 42)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(SwiftUI.Color.accentColor.opacity(0.12)))
+        Button { showNoteSelectorView = true } label: {
+            HStack(spacing: 16) {
+                Image(systemName: "book.closed")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundColor(.primary)
+                    .frame(width: 32)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(notesViewModel.loadingState.isLoading
-                         ? "Loading your notes…"
-                         : "\(notesViewModel.selectedCount) of \(notesViewModel.allNotes.count) notes selected")
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Scegli le note")
                         .font(.headline)
-                    libraryStatus
-                }
-                Spacer(minLength: 8)
-                Button { showNoteSelectorView = true } label: {
-                    Label("Choose Notes…", systemImage: "line.3.horizontal.decrease.circle")
-                }
-                .keyboardShortcut("f", modifiers: [.command])
-                .disabled(notesViewModel.loadingState.isLoading)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
-        } label: {
-            Text("Notes")
-        }
-    }
-
-    @ViewBuilder
-    private var libraryStatus: some View {
-        if notesViewModel.loadingState.isLoading {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Reading the local Notes library")
-            }
-            .font(.subheadline)
-            .foregroundColor(.secondary)
-        } else if let error = notesViewModel.loadingState.errorMessage {
-            Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.subheadline)
-                .foregroundColor(.red)
-                .lineLimit(2)
-                .help(error)
-        } else if !sharedState.licenseAccepted {
-            Text("Accept the license and grant Full Disk Access to load notes.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        } else if notesViewModel.loadingState == .loaded && notesViewModel.allNotes.isEmpty {
-            Text("No notes found. Make sure Notes has synced to this Mac.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        } else if notesViewModel.selectedCount == 0 {
-            Text("Search by title or browse an account and folder.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        } else {
-            Text("Ready to export from \(sharedState.fromAccountsCount) account\(sharedState.fromAccountsCount == 1 ? "" : "s").")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        }
-    }
-
-    private var formatCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Picker("Format", selection: $outputFormat) {
-                        ForEach(ExportFormat.allCases, id: \.self) { format in
-                            Text(format.rawValue).tag(format.rawValue)
-                        }
-                    }
-                    .frame(width: 180)
-                    Text(selectedFormat.blurb)
+                    Text(notesViewModel.loadingState.isLoading
+                         ? "Caricamento…"
+                         : selectionCountDescription)
                         .font(.subheadline)
                         .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if selectedFormat.hasOptionsSheet {
-                        Button(selectedFormat == .pdf ? "PDF Preferences…" : "Options…") {
-                            showFormatOptionsView = true
-                        }
+                    if let error = notesViewModel.loadingState.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .lineLimit(2)
                     }
                 }
 
-                if selectedFormat == .pdf {
-                    Divider()
-                    HStack(alignment: .center, spacing: 12) {
-                        Text("PDF layout")
-                            .font(.subheadline.weight(.medium))
-                        Picker("PDF layout", selection: $exportViewModel.configurations.pdf.styleProfile) {
-                            ForEach(PDFStyleProfile.allCases, id: \.self) { profile in
-                                Text(profile.displayName).tag(profile)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 280)
-                    }
-                    Text(exportViewModel.configurations.pdf.styleProfile.description)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    HStack(alignment: .center, spacing: 12) {
-                        Text("PDF attachments")
-                            .font(.subheadline.weight(.medium))
-                        Picker("PDF attachments", selection: $exportViewModel.configurations.pdf.attachmentMode) {
-                            ForEach(PDFAttachmentMode.allCases) { mode in
-                                Text(mode.displayName).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 300)
-                    }
-                    Text(exportViewModel.configurations.pdf.attachmentMode.description)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
-        } label: {
-            Text("Export format")
+            .padding(.horizontal, 18)
+            .padding(.vertical, 19)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("f", modifiers: [.command])
+        .disabled(notesViewModel.loadingState.isLoading)
+        .accessibilityIdentifier("noteSelectionButton")
+    }
+
+    private var selectionCountDescription: String {
+        let count = notesViewModel.selectedCount
+        return count == 1 ? "1 nota selezionata" : "\(count) note selezionate"
+    }
+
+    private var formatSection: some View {
+        HStack(alignment: .center, spacing: 16) {
+            Text(selectedFormat.rawValue)
+                .font(.system(size: 38, weight: .semibold, design: .rounded))
+                .accessibilityLabel("Formato: \(selectedFormat.rawValue)")
+
+            Spacer(minLength: 12)
+
+            Menu {
+                ForEach(ExportFormat.allCases, id: \.self) { format in
+                    Button {
+                        outputFormat = format.rawValue
+                    } label: {
+                        if format == selectedFormat {
+                            Label(format.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(format.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                Label("Cambia formato", systemImage: "chevron.down")
+                    .labelStyle(.titleAndIcon)
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityIdentifier("formatMenu")
+        }
+        .padding(.top, 2)
+    }
+
+    private var pdfChoiceSections: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Aspetto")
+                    .font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    LargeSelectionButton(
+                        title: "Originale",
+                        subtitle: "Come in Note",
+                        systemImage: "doc.text",
+                        isSelected: exportViewModel.configurations.pdf.styleProfile == .faithful
+                    ) {
+                        exportViewModel.configurations.pdf.styleProfile = .faithful
+                    }
+                    .accessibilityIdentifier("pdfStyleFaithful")
+
+                    LargeSelectionButton(
+                        title: "Per studiare",
+                        subtitle: "Più leggibile",
+                        systemImage: "book",
+                        isSelected: exportViewModel.configurations.pdf.styleProfile == .study
+                    ) {
+                        exportViewModel.configurations.pdf.styleProfile = .study
+                    }
+                    .accessibilityIdentifier("pdfStyleStudy")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Allegati")
+                    .font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    LargeSelectionButton(
+                        title: "Con anteprima",
+                        subtitle: nil,
+                        systemImage: "photo",
+                        isSelected: exportViewModel.configurations.pdf.attachmentMode == .previewAndEmbed
+                    ) {
+                        exportViewModel.configurations.pdf.attachmentMode = .previewAndEmbed
+                    }
+                    .accessibilityIdentifier("pdfAttachmentPreview")
+
+                    LargeSelectionButton(
+                        title: "Solo file",
+                        subtitle: nil,
+                        systemImage: "paperclip",
+                        isSelected: exportViewModel.configurations.pdf.attachmentMode == .embedOnly
+                    ) {
+                        exportViewModel.configurations.pdf.attachmentMode = .embedOnly
+                    }
+                    .accessibilityIdentifier("pdfAttachmentOnly")
+                }
+            }
         }
     }
 
     private var destinationCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    Image(systemName: destinationSystemImage)
-                        .foregroundColor(.secondary)
-                    Text(destinationLabel)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Button("Choose…", action: selectOutputFolder)
-                }
-                if selectedFormat == .pdf {
-                    Text(isSingleNotePDFMode
-                         ? "One PDF is saved directly in this folder. Existing names are never overwritten; supported images are embedded, and unavailable attachments are reported."
-                         : "Multiple notes are exported as individual PDFs using the selected folder, archive, or legacy account/folder layout. They are not combined into one PDF.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(.vertical, 4)
-        } label: {
-            Text("Save to")
-        }
-    }
+        HStack(spacing: 14) {
+            Image(systemName: destinationSystemImage)
+                .font(.system(size: 21, weight: .medium))
+                .frame(width: 30)
+                .foregroundColor(.secondary)
 
-    private var destinationLabel: String {
-        outputPath.isEmpty ? "Choose an output location" : outputPath
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Destinazione")
+                    .font(.headline)
+                Text(destinationPathDescription)
+                    .font(.subheadline)
+                    .foregroundColor(outputPath.isEmpty ? .secondary : .primary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button(action: selectOutputFolder) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 42, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Cambia destinazione")
+            .accessibilityIdentifier("chooseDestinationButton")
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+        )
     }
 
     private var destinationSystemImage: String {
         if isSingleNotePDFMode { return "folder" }
         return exportViewModel.configurations.archiveFormat?.systemImage
             ?? (exportViewModel.configurations.concatenateOutput ? "doc.text" : "folder")
+    }
+
+    private var destinationPathDescription: String {
+        outputPath.isEmpty ? "Scegli una cartella o un file" : outputPath
     }
 
     private var advancedOutputOptions: some View {
@@ -582,75 +606,101 @@ struct AppleNotesExporterView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 12) {
-                    Image(systemName: "doc.richtext")
-                        .font(.system(size: 30, weight: .medium))
-                        .foregroundColor(.accentColor)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Apple Notes Exporter")
-                            .font(.largeTitle.weight(.semibold))
-                        Text("Find the notes you need and export them in a few steps.")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
+                    Text("Apple Notes Exporter")
+                        .font(.title2.weight(.semibold))
                     Spacer()
+
+                    Menu {
+                        if selectedFormat.hasOptionsSheet {
+                            Button("Preferenze formato…") { showFormatOptionsView = true }
+                        }
+                        Button("Opzioni avanzate…") { showAdvancedOutputOptionsView = true }
+                        Divider()
+                        Button("Configurazione MCP…") { showMCPSetupView = true }
+                        Button("Permessi e licenza…") { showLicensePermissionsView = true }
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 18, weight: .medium))
+                            .frame(width: 38, height: 38)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityLabel("Impostazioni")
+                    .accessibilityIdentifier("settingsMenu")
                 }
 
                 notesCard
-                formatCard
+
+                Divider()
+
+                formatSection
+                if selectedFormat == .pdf {
+                    pdfChoiceSections
+                }
+
                 destinationCard
 
-                DisclosureGroup("Advanced output options", isExpanded: $showAdvancedOutputOptions) {
-                    if isSingleNotePDFMode {
-                        Text("Single-note PDF always writes one non-overwriting PDF into the chosen folder. Multi-note container, attachment-folder, and sync options do not apply to this export.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        advancedOutputOptions
-                    }
-                }
-                .padding(.horizontal, 4)
-
                 if showSyncWarning {
-                    Label("Sync updates files in the chosen folder. Apple Notes remains the source of truth.", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundColor(.orange)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(SwiftUI.Color.orange.opacity(0.1)))
-                        .transition(.opacity)
+                    Label(
+                        "La sincronizzazione aggiorna i file già presenti. \(lastSyncedText)",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Button(action: triggerExportNotes) {
-                    Label(
-                        exportViewModel.configurations.incrementalSync ? "Sync (\(lastSyncedText))" : "Export \(selectedFormat.rawValue)",
-                        systemImage: "arrow.down.doc.fill"
+                HStack(spacing: 12) {
+                    Button {
+                        showPDFPreview = true
+                    } label: {
+                        Label("Anteprima", systemImage: "eye")
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 48)
+                    }
+                    .buttonStyle(.bordered)
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(
+                        selectedFormat != .pdf
+                            || notesViewModel.selectedCount == 0
+                            || notesViewModel.loadingState.isLoading
                     )
-                    .frame(maxWidth: .infinity)
-                    .font(.headline)
+                    .accessibilityIdentifier("previewButton")
+
+                    Button(action: triggerExportNotes) {
+                        Label(
+                            exportButtonTitle,
+                            systemImage: "square.and.arrow.down"
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .font(.headline)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        notesViewModel.selectedCount == 0
+                            || outputPath.isEmpty
+                            || notesViewModel.loadingState.isLoading
+                    )
+                    .accessibilityIdentifier("exportButton")
                 }
-                .buttonStyle(BorderedProminentButtonStyle())
-                .keyboardShortcut(.defaultAction)
-                .disabled(notesViewModel.selectedCount == 0 || outputPath.isEmpty || notesViewModel.loadingState.isLoading)
 
                 if notesViewModel.selectedCount == 0 || outputPath.isEmpty {
-                    Text("Choose at least one note and a destination to enable export.")
+                    Text(notesViewModel.selectedCount == 0
+                         ? "Scegli almeno una nota per continuare."
+                         : "Scegli una destinazione per continuare.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .frame(maxWidth: .infinity, alignment: .center)
                 }
-
-                Text("Apple Notes Exporter v\(APP_VERSION) · GNU GPL v3")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
             }
             .padding(22)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: 620, idealWidth: 680, minHeight: 590, idealHeight: 700)
+        .frame(minWidth: 540, idealWidth: 660, minHeight: 620, idealHeight: 720)
         .onAppear {
             showSyncWarning = exportViewModel.configurations.incrementalSync
             normalizeOutputPathForContainer()
@@ -704,6 +754,11 @@ struct AppleNotesExporterView: View {
         .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.styleProfile) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.attachmentMode) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.fontFamily) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.marginSize) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.marginUnit) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.pageSize) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.incrementalSync) { _ in
@@ -721,6 +776,53 @@ struct AppleNotesExporterView: View {
                     }
                 }
         }
+        .sheet(isPresented: $showNoteSelectorView) {
+            NoteSelectorView(sharedState: sharedState, showNoteSelectorView: $showNoteSelectorView)
+                .frame(width: 920, height: 620)
+        }
+        .sheet(isPresented: $showMCPSetupView) {
+            MCPSetupView(showMCPSetupView: $showMCPSetupView)
+        }
+        .sheet(isPresented: $showFormatOptionsView) {
+            if let format = ExportFormat(rawValue: outputFormat) {
+                FormatOptionsView(showOptionsView: $showFormatOptionsView, format: format)
+            }
+        }
+        .sheet(isPresented: $showAdvancedOutputOptionsView) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Opzioni avanzate")
+                        .font(.title2.weight(.semibold))
+                    Spacer()
+                    Button("Fine") {
+                        exportViewModel.saveConfigurations()
+                        showAdvancedOutputOptionsView = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+                Divider()
+                ScrollView {
+                    advancedOutputOptions
+                        .padding(.bottom, 18)
+                }
+            }
+            .padding(20)
+            .frame(minWidth: 520, idealWidth: 600, minHeight: 560, idealHeight: 680)
+        }
+        .sheet(isPresented: $showPDFPreview) {
+            PDFPreviewSheet(
+                notes: notesViewModel.selectedNotes,
+                exportViewModel: exportViewModel,
+                isPresented: $showPDFPreview
+            )
+            .frame(minWidth: 850, idealWidth: 1120, minHeight: 620, idealHeight: 780)
+        }
+        .sheet(isPresented: $showLicensePermissionsView) {
+            LicensePermissionsView(
+                sharedState: sharedState,
+                showLicensePermissionsView: $showLicensePermissionsView
+            )
+        }
         .alert(isPresented: $showAlert) {
             switch activeAlert {
             case .noneSelected:
@@ -737,32 +839,367 @@ struct AppleNotesExporterView: View {
                 )
             }
         }
-        .sheet(isPresented: $showNoteSelectorView) {
-            NoteSelectorView(sharedState: sharedState, showNoteSelectorView: $showNoteSelectorView)
-                .frame(width: 920, height: 620)
-        }
-        .sheet(isPresented: $showMCPSetupView) {
-            MCPSetupView(showMCPSetupView: $showMCPSetupView)
-        }
-        .sheet(isPresented: $showFormatOptionsView) {
-            if let format = ExportFormat(rawValue: outputFormat) {
-                FormatOptionsView(showOptionsView: $showFormatOptionsView, format: format)
+    }
+
+    private var exportButtonTitle: String {
+        let count = notesViewModel.selectedCount
+        if exportViewModel.configurations.incrementalSync { return "Sincronizza" }
+        return count == 1 ? "Esporta 1 nota" : "Esporta \(count) note"
+    }
+
+}
+
+
+@MainActor
+private struct PDFPreviewSheet: View {
+    @ObservedObject private var exportViewModel: ExportViewModel
+    @StateObject private var previewModel: PDFPreviewViewModel
+    @State private var selectedNoteID: String?
+    @Binding private var isPresented: Bool
+
+    let notes: [NotesNote]
+
+    init(notes: [NotesNote], exportViewModel: ExportViewModel, isPresented: Binding<Bool>) {
+        self.notes = notes
+        self.exportViewModel = exportViewModel
+        _isPresented = isPresented
+        _selectedNoteID = State(initialValue: notes.first?.id)
+        _previewModel = StateObject(wrappedValue: PDFPreviewViewModel(exportViewModel: exportViewModel))
+    }
+
+    private var settingsKey: PDFPreviewSettingsKey {
+        PDFPreviewSettingsKey(configuration: exportViewModel.configurations.pdf)
+    }
+
+    private var selectedNote: NotesNote? {
+        notes.first(where: { $0.id == selectedNoteID }) ?? notes.first
+    }
+
+    private var noteIDs: [String] { notes.map(\.id) }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Preferenze")
+                        .font(.title2.weight(.semibold))
+
+                    Picker("Aspetto", selection: $exportViewModel.configurations.pdf.styleProfile) {
+                        Text("Originale").tag(PDFStyleProfile.faithful)
+                        Text("Per studiare").tag(PDFStyleProfile.study)
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("previewStylePicker")
+
+                    Picker("Allegati", selection: $exportViewModel.configurations.pdf.attachmentMode) {
+                        Text("Con anteprima").tag(PDFAttachmentMode.previewAndEmbed)
+                        Text("Solo file").tag(PDFAttachmentMode.embedOnly)
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("previewAttachmentPicker")
+
+                    Divider()
+
+                    Picker("Carattere", selection: $exportViewModel.configurations.pdf.htmlConfiguration.fontFamily) {
+                        ForEach(HTMLConfiguration.FontFamily.allCases, id: \.self) { family in
+                            Text(family.rawValue).tag(family)
+                        }
+                    }
+
+                    Stepper(
+                        value: $exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints,
+                        in: 8...32,
+                        step: 1
+                    ) {
+                        HStack {
+                            Text("Dimensione")
+                            Spacer(minLength: 8)
+                            Text("\(Int(exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints)) pt")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Picker("Margini", selection: $exportViewModel.configurations.pdf.htmlConfiguration.marginUnit) {
+                        ForEach(HTMLConfiguration.MarginUnit.allCases, id: \.self) { unit in
+                            Text(unit.displayName).tag(unit)
+                        }
+                    }
+
+                    Stepper(
+                        value: $exportViewModel.configurations.pdf.htmlConfiguration.marginSize,
+                        in: 0...96,
+                        step: 2
+                    ) {
+                        HStack {
+                            Text("Ampiezza")
+                            Spacer(minLength: 8)
+                            Text("\(Int(exportViewModel.configurations.pdf.htmlConfiguration.marginSize)) \(exportViewModel.configurations.pdf.htmlConfiguration.marginUnit.displayName)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Picker("Formato pagina", selection: $exportViewModel.configurations.pdf.pageSize) {
+                        ForEach(PDFConfiguration.PageSize.allCases, id: \.self) { size in
+                            Text(size.rawValue).tag(size)
+                        }
+                    }
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minWidth: 250, idealWidth: 300, maxWidth: 340)
+
+            Divider()
+
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("Anteprima")
+                        .font(.title2.weight(.semibold))
+
+                    if notes.count > 1 {
+                        Picker("Nota", selection: $selectedNoteID) {
+                            ForEach(notes, id: \.id) { note in
+                                Text(note.title).tag(Optional(note.id))
+                            }
+                        }
+                        .frame(maxWidth: 280)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Label(
+                        previewModel.isUpdating ? "Aggiornamento…" : "Aggiornamento automatico",
+                        systemImage: previewModel.isUpdating ? "arrow.triangle.2.circlepath" : "checkmark.circle"
+                    )
+                    .accessibilityIdentifier("pdfPreviewStatus")
+                    .font(.subheadline)
+                    .foregroundColor(previewModel.isUpdating ? .secondary : .green)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+
+                Divider()
+
+                Group {
+                    if notes.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 32))
+                                .foregroundColor(.secondary)
+                            Text("Nessuna nota selezionata")
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if let document = previewModel.document {
+                        PDFPreviewDocumentView(document: document)
+                            .id(selectedNote?.id)
+                            .accessibilityIdentifier("pdfPreviewDocument")
+                            .padding(18)
+                    } else if let error = previewModel.errorMessage {
+                        VStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 30))
+                                .foregroundColor(.orange)
+                            Text("Anteprima non disponibile")
+                                .font(.headline)
+                            Text(error)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(28)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                            Text("Preparazione dell’anteprima…")
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(SwiftUI.Color(nsColor: .underPageBackgroundColor))
             }
         }
-        .sheet(isPresented: $showLicensePermissionsView) {
-            LicensePermissionsView(
-                sharedState: sharedState,
-                showLicensePermissionsView: $showLicensePermissionsView
-            )
-            .frame(width: 600, height: 400)
-            .onAppear {
-                NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    event.keyCode == 53 ? nil : event
+        .overlay(alignment: .bottomTrailing) {
+            Button("Chiudi") { isPresented = false }
+                .keyboardShortcut(.cancelAction)
+                .padding(18)
+        }
+        .onAppear { refreshPreview() }
+        .onChange(of: selectedNoteID) { _ in refreshPreview() }
+        .onChange(of: noteIDs) { newIDs in
+            if !newIDs.contains(selectedNoteID ?? "") {
+                selectedNoteID = newIDs.first
+            }
+            refreshPreview()
+        }
+        .onChange(of: settingsKey) { _ in refreshPreview() }
+        .onDisappear { previewModel.cancel() }
+    }
+
+    private func refreshPreview() {
+        previewModel.schedule(for: selectedNote)
+    }
+}
+
+@MainActor
+private final class PDFPreviewViewModel: ObservableObject {
+    @Published private(set) var document: PDFDocument?
+    @Published private(set) var isUpdating = false
+    @Published private(set) var errorMessage: String?
+
+    private let exportViewModel: ExportViewModel
+    private var generationTask: Task<Void, Never>?
+    private var currentRequestID = UUID()
+
+    init(exportViewModel: ExportViewModel) {
+        self.exportViewModel = exportViewModel
+    }
+
+    func schedule(for note: NotesNote?) {
+        generationTask?.cancel()
+        let requestID = UUID()
+        currentRequestID = requestID
+        errorMessage = nil
+
+        guard let note else {
+            isUpdating = false
+            document = nil
+            return
+        }
+
+        isUpdating = true
+        generationTask = Task { [weak self, exportViewModel] in
+            do {
+                try await Task.sleep(nanoseconds: 350_000_000)
+                try Task.checkCancellation()
+                let data = try await exportViewModel.generatePDFPreviewData(for: note)
+                try Task.checkCancellation()
+                guard let self, self.currentRequestID == requestID else { return }
+                guard let document = PDFDocument(data: data) else {
+                    throw ExportError.invalidGeneratedPDF
                 }
+                self.document = document
+                self.errorMessage = nil
+                self.isUpdating = false
+            } catch is CancellationError {
+                guard let self, self.currentRequestID == requestID else { return }
+                self.isUpdating = false
+            } catch {
+                guard let self, self.currentRequestID == requestID else { return }
+                self.errorMessage = error.localizedDescription
+                self.isUpdating = false
             }
         }
     }
 
+    func cancel() {
+        currentRequestID = UUID()
+        generationTask?.cancel()
+        generationTask = nil
+        isUpdating = false
+    }
+}
+
+private struct PDFPreviewSettingsKey: Equatable {
+    let fontFamily: String
+    let fontSizePoints: Double
+    let marginSize: Double
+    let marginUnit: String
+    let pageSize: String
+    let styleProfile: String
+    let attachmentMode: String
+
+    init(configuration: PDFConfiguration) {
+        fontFamily = configuration.htmlConfiguration.fontFamily.rawValue
+        fontSizePoints = configuration.htmlConfiguration.fontSizePoints
+        marginSize = configuration.htmlConfiguration.marginSize
+        marginUnit = configuration.htmlConfiguration.marginUnit.rawValue
+        pageSize = configuration.pageSize.rawValue
+        styleProfile = configuration.styleProfile.rawValue
+        attachmentMode = configuration.attachmentMode.rawValue
+    }
+}
+
+private struct PDFPreviewDocumentView: NSViewRepresentable {
+    let document: PDFDocument
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.displayDirection = .vertical
+        view.displaysPageBreaks = true
+        view.backgroundColor = .underPageBackgroundColor
+        view.document = document
+        return view
+    }
+
+    func updateNSView(_ view: PDFView, context: Context) {
+        guard view.document !== document else { return }
+
+        let currentPageIndex = view.document.flatMap { oldDocument in
+            view.currentPage.map(oldDocument.index(for:))
+        }
+        let previousScale = view.scaleFactor
+        let shouldPreserveScale = view.document != nil && previousScale > 0
+
+        view.document = document
+        view.autoScales = true
+        DispatchQueue.main.async {
+            view.layoutSubtreeIfNeeded()
+            if let currentPageIndex, document.pageCount > 0 {
+                let safePageIndex = min(currentPageIndex, document.pageCount - 1)
+                if let page = document.page(at: safePageIndex) { view.go(to: page) }
+            }
+            if shouldPreserveScale { view.scaleFactor = previousScale }
+        }
+    }
+}
+
+private struct LargeSelectionButton: View {
+    let title: String
+    let subtitle: String?
+    let systemImage: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 22, weight: .medium))
+                    .frame(height: 26)
+                Text(title)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: subtitle == nil ? 92 : 112)
+            .padding(.horizontal, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? SwiftUI.Color.accentColor : SwiftUI.Color.secondary.opacity(0.28),
+                        lineWidth: isSelected ? 2 : 1
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(isSelected ? "Selezionato" : "Non selezionato")
+    }
 }
 
 // MARK: - Pointer Cursor for Links

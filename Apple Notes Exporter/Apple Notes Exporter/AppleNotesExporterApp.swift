@@ -167,6 +167,10 @@ struct Apple_Notes_ExporterApp: App {
         ProcessInfo.processInfo.arguments.contains("--ui-testing")
     }
 
+    private static var isUITestExporterMainMode: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing-exporter-main")
+    }
+
     private static var isRunningUnderXCTest: Bool {
         return NSClassFromString("XCTestCase") != nil
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
@@ -225,7 +229,12 @@ struct Apple_Notes_ExporterApp: App {
 
     var body: some Scene {
         WindowGroup(id: "main") {
-            if Self.isUITestFixtureMode {
+            if Self.isUITestExporterMainMode {
+                AppleNotesExporterView(sharedState: sharedState)
+                    .environmentObject(notesViewModel)
+                    .environmentObject(exportViewModel)
+                    .onAppear { NSWindow.allowsAutomaticWindowTabbing = false }
+            } else if Self.isUITestFixtureMode {
                 NotesSelectionUITestHost(sharedState: sharedState)
                     .environmentObject(notesViewModel)
                     .frame(minWidth: 900, minHeight: 620)

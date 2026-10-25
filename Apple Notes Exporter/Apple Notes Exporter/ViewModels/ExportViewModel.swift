@@ -186,6 +186,42 @@ enum PDFWebViewIsolation {
     }
 }
 
+
+/// AppKit/WebKit PDF capture is not safe to overlap. The permit remains held
+/// until the print callback completes, including when its waiting task is
+/// cancelled, so preview refreshes cannot race an export's pending print.
+@MainActor
+private final class PDFRenderCoordinator {
+    static let shared = PDFRenderCoordinator()
+
+    private var isOccupied = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func withExclusiveAccess<T>(_ operation: @MainActor () async throws -> T) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if !isOccupied {
+            isOccupied = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            isOccupied = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
@@ -279,6 +315,7 @@ class ExportViewModel: ObservableObject {
     private var activePDFWebViews: [UUID: WKWebView] = [:]
     private var activePDFNavigationDelegates: [UUID: PDFNavigationDelegate] = [:]
     private var timedOutPDFRenderIDs: Set<UUID> = []
+    private var suppressExportLogMessages = false
 
     // MARK: - Concurrency Settings
 
@@ -635,6 +672,52 @@ class ExportViewModel: ObservableObject {
     /// Export one note as a self-contained PDF into a user-selected folder.
     /// This is an opt-in app path; the existing tree, archive, sync, CLI and
     /// MCP routes continue to use `exportNotes` unchanged.
+    /// Render an in-memory PDF preview through the exact standalone-PDF path
+    /// used by export, while keeping its temporary files and diagnostics isolated
+    /// from the user's selected destination and from the active export model.
+    func generatePDFPreviewData(for note: NotesNote) async throws -> Data {
+        let previewRenderer = ExportViewModel(repository: repository, databasePath: databasePath)
+        previewRenderer.configurations = configurations
+        previewRenderer.suppressExportLogMessages = true
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("apple-notes-exporter-preview-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        await previewRenderer.exportSingleNotePDF(note, toDirectory: directory)
+        try Task.checkCancellation()
+
+        switch previewRenderer.exportState {
+        case .completed:
+            guard let artifactURL = previewRenderer.lastExportArtifactURL,
+                  artifactURL.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else {
+                throw ExportError.invalidGeneratedPDF
+            }
+            let data = try Data(contentsOf: artifactURL, options: [.mappedIfSafe])
+            guard PDFDocument(data: data)?.pageCount ?? 0 > 0 else {
+                throw ExportError.invalidGeneratedPDF
+            }
+            return data
+        case .cancelled:
+            throw CancellationError()
+        case .error(let message):
+            throw NSError(
+                domain: "AppleNotesExporter.PDFPreview",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        case .idle, .exporting:
+            throw ExportError.invalidGeneratedPDF
+        }
+    }
+
     func exportSingleNotePDF(
         _ note: NotesNote,
         toDirectory destinationDirectory: URL
@@ -855,7 +938,9 @@ class ExportViewModel: ObservableObject {
             failedNotesCount = 1
             exportState = .error(error.localizedDescription)
             log("✗ Failed to export standalone PDF for '\(note.title)': \(error.localizedDescription)")
-            Logger.noteExport.error("Standalone PDF export failed: \(error.localizedDescription, privacy: .public)")
+            if !suppressExportLogMessages {
+                Logger.noteExport.error("Standalone PDF export failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -883,6 +968,26 @@ class ExportViewModel: ObservableObject {
         margins: NSEdgeInsets,
         baseURL: URL? = nil,
         timeoutSeconds: UInt64 = 60
+    ) async throws {
+        try await PDFRenderCoordinator.shared.withExclusiveAccess {
+            try await self.renderPDFHTMLExclusive(
+                html,
+                to: url,
+                pageSize: pageSize,
+                margins: margins,
+                baseURL: baseURL,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    }
+
+    private func renderPDFHTMLExclusive(
+        _ html: String,
+        to url: URL,
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL?,
+        timeoutSeconds: UInt64
     ) async throws {
         try Task.checkCancellation()
         if shouldCancel { throw CancellationError() }
@@ -1595,6 +1700,7 @@ class ExportViewModel: ObservableObject {
 
     /// Add a log entry (thread-safe)
     private func log(_ message: String) {
+        guard !suppressExportLogMessages else { return }
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         logLock.lock()
         defer { logLock.unlock() }
@@ -1732,7 +1838,7 @@ class ExportViewModel: ObservableObject {
                 htmlBody = try await repository.generateHTML(forNoteId: note.id)
             } catch {
                 // Fallback to plaintext if HTML generation fails (corrupted protobuf, etc.)
-                Logger.noteExport.warning("Failed to generate HTML for note \(note.id), falling back to plaintext: \(error)")
+                Logger.noteExport.warning("Failed to generate rich note HTML; falling back to plaintext.")
                 if standalonePDF {
                     log("⚠︎ Rich note content could not be generated; the PDF uses a plain-text fallback.")
                 }
