@@ -426,6 +426,20 @@ struct AppleNotesExporterView: View {
                     Text(exportViewModel.configurations.pdf.styleProfile.description)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    HStack(alignment: .center, spacing: 12) {
+                        Text("PDF attachments")
+                            .font(.subheadline.weight(.medium))
+                        Picker("PDF attachments", selection: $exportViewModel.configurations.pdf.attachmentMode) {
+                            ForEach(PDFAttachmentMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 300)
+                    }
+                    Text(exportViewModel.configurations.pdf.attachmentMode.description)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -689,6 +703,7 @@ struct AppleNotesExporterView: View {
         .onChange(of: exportViewModel.configurations.filenameDateFormat) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.pdf.styleProfile) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.attachmentMode) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
         .onChange(of: exportViewModel.configurations.incrementalSync) { _ in

@@ -2,6 +2,8 @@
 
 **Decision: READY WITH LIMITATIONS**
 **Date:** 2026-10-23
+
+> **P3-B correction (2026-10-25):** The later user correction supersedes the original §12 P3-B requirement to append attachment pages. The current contract is a single standalone note PDF with compact inline references and the original PDF embedded as a file; attached pages are never added to the note page tree. The P3-B and validation notes below reflect the corrected contract. Earlier P2/P3 statements are historical snapshots.
 **Integration branch:** `codex/notes-pdf-integration`
 **Integration pre-wiring HEAD:** `d618d785b5a9d45e0dc1eb85f1af20913a6fab88`
 **Baseline:** `main` at `e05a858168e9a33d08e3748f0a37547a60f50fa2`
@@ -219,33 +221,63 @@ The selector now presents an explicit checkbox for each note, account/folder agg
 
 A synthetic UI test was added, but it did **not** complete: the UI-test runner stalled before establishing its test connection. Therefore the interactive checkbox, cross-folder retention, keyboard accessibility, resize behavior, and export-dialog flow are not claimed as UI-accepted on this run.
 
-### P3-B — visible PDF attachment pages
+### P3-B — compact references with original PDF embedded (corrected requirement)
 
-The PDF path fetches bytes only through the ownership-verified repository method. Each attachment occurrence receives a unique marker token; the renderer divides the surrounding HTML at those markers, renders the HTML portions, then composes the generated pages with the source PDF pages in order. The source `PDFPage` objects are inserted rather than converted to bitmaps, retaining their page sizes/rotation and vector/text content where PDFKit supports it. The output is re-opened and page-count checked before it is accepted. The original PDF is **not** separately embedded as a downloadable embedded-file attachment; embedded-file annotations were deferred, so compatibility across PDF viewers for that optional representation remains unverified.
+The app offers two persisted choices before export, both independent of Faithful/Study:
 
-Safety bounds are 96 MiB per attachment, 256 MiB total attachment bytes, 500 pages per attachment, and 2,000 total inserted pages. Empty, locked, corrupt, oversized, missing, or unplaceable attachments fail the export rather than being silently omitted from an otherwise “complete” PDF. PNG/JPEG processing remains on its pre-existing path.
+| Mode | Inline appearance at the original marker | Original PDF | Added note pages |
+|---|---|---|---:|
+| **Preview + embed** (default) | Small first-page thumbnail, PDF icon and filename | Embedded once per distinct attachment ID | 0 |
+| **Embed only** | Compact PDF icon and filename; no thumbnail is generated | Embedded once per distinct attachment ID | 0 |
+
+The source bytes are fetched through `fetchAttachment(id:ownedByNoteID:)`, so the repository verifies ownership against the note being exported. Marker replacement keeps each reference at its original position and sequence. Duplicate occurrences of one attachment ID are represented in place but create only one embedded file; conflicting bytes under a repeated ID fail closed. Different files with the same filename receive unique keys. The attachment remains extractable from the single exported PDF; no companion ZIP or sibling file is produced by this workflow.
+
+`PDFEmbeddedFileWriter` writes document-level `/Names /EmbeddedFiles` file specifications using an incremental update, preserving existing trailer entries such as `/Info` and `/ID` while updating `/Size`, `/Root`, and `/Prev`. It does not add page objects to the note page tree. The generated PDF is reopened and its page count checked. A two-page note with an attached three-page synthetic PDF remained two pages; qpdf and Poppler extracted the embedded source byte-for-byte. Embedded-file support requires PDF 1.4; when needed the catalog version is raised through the incremental update. Encrypted, malformed, unsupported-xref, or already-attached source documents fail closed rather than being rewritten ambiguously.
+
+Per-file and aggregate source-byte limits are 96 MiB and 256 MiB. Missing, locked, corrupt, oversized, or unplaceable inputs leave an explicit inline reference and warning or fail export when safe embedding cannot proceed. Available bytes from a damaged PDF are retained where possible, but the export is marked partial and no preview is generated. A valid PDF whose preview thumbnail fails still embeds unchanged and shows a preview-unavailable status.
+
+The outer build occurs in a private 0700 staging directory. For final delivery, the completed PDF is copied into a destination-local private 0700 staging directory, restricted while staged, then moved to a collision-safe final name on the same volume; an existing file is never replaced. The final mode of the completed PDF is preserved. Temporary delivery staging is removed on success or failure.
+
+**Practical reader check (2026-10-25, macOS 27.0.1):** Preview.app opened and rendered the synthetic note PDF, reporting “Page 1 of 2” and showing two note-page thumbnails; the embedded three-page source did not increase the note page count. The tested file was a writer-only fixture (it did not include the app-generated inline card). Preview's observed View sidebar offered Thumbnails, Table of Contents, Highlights and Notes, Bookmarks, and Contact Sheet; its Inspector offered General, Keywords, Encryption, Crop, and Annotations. No EmbeddedFiles list or open/extract command was exposed, so the original attachment could not be retrieved through the Preview UI in this test. Poppler 26.10.0 provides the independent reader-tool check: `pdfinfo` reported 2 pages and PDF 1.4, `pdftoppm` rendered the note page, `pdfdetach -list` found the embedded original, and `pdfdetach -save 1` recovered bytes identical to `three-page-source.pdf`. qpdf 12.4.2 `--check`, `--list-attachments`, and `--show-attachment` also passed. This establishes Preview note-page rendering plus Poppler attachment extraction, but **not** attachment extraction through Preview or compatibility with a second graphical viewer. Adobe Acrobat was not installed/launched and is not counted as a practical test. See [Adobe's attachment instructions](https://helpx.adobe.com/acrobat/desktop/edit-documents/use-links-and-attachments/open-attachment.html), [qpdf's attachment options](https://qpdf.readthedocs.io/en/stable/cli.html#embedded-files-attachments), and the [Preview User Guide](https://support.apple.com/guide/preview/welcome/mac).
 
 ### P3-C/P3-D — presentation and launch path
 
 The selector is reorganized around an account/folder sidebar and central note list, with visible selection state; existing export options and engine remain in place. A synthetic in-memory UI-test host avoids reading the user's Notes store. The helper `scripts/run-integration-app.sh` builds the explicit integration `.xcodeproj`/scheme into isolated DerivedData and launches that exact product, using `MACOSX_DEPLOYMENT_TARGET=13.0` only as a command-line diagnostic override. Its syntax was checked with `bash -n`. The permanent project deployment target remains 11.0.
 
-The stale UI seen when pressing ⌘R is **not diagnosed conclusively**. Explicit project/scheme settings point `SRCROOT`/`PROJECT_DIR` to this worktree, but the active Xcode window/run executable and any competing original-app process could not be verified. The Mac was locked during the UI attempt; the script itself was not used as proof of interactive acceptance. No new manual Notes-library test was performed.
+The stale UI seen when pressing ⌘R is **not diagnosed conclusively**. Explicit project/scheme settings point `SRCROOT`/`PROJECT_DIR` to this worktree, but the active Xcode window/run executable and any competing original-app process could not be verified. The script itself was not used as proof of interactive acceptance. No new manual Notes-library test was performed.
 
 ### Validation evidence and open failures
 
 | Check | Outcome | Evidence |
 |---|---|---|
-| Focused PDF/renderer regressions | **PASS — 14 passed, 0 failed, 0 skipped** | `/private/tmp/apple-notes-exporter-p3-focused-r1-20261025.xcresult`; includes synthetic PDF page composition/order/geometry/visible-content checks, limits and error paths, WebKit isolation, pending-print cancellation, and Faithful/Study render checks. |
-| Complete app/unit target | **PARTIAL — 195 passed, 1 failed, 0 skipped** | `/private/tmp/apple-notes-exporter-p3-unit-final-20261025.xcresult`; the app/test code compiled. Sole failure: `test_zipDirectory_preservesFileModificationDates`, expected `1400000000`, observed `1400003600` (a +3600-second difference). No production ZIP code was changed in P3. |
-| ZIP timestamp rerun with `TZ=UTC` | **FAIL — same assertion** | `/private/tmp/apple-notes-exporter-p3-unit-r2-20261025.xcresult` records 194 passed and the same one failed (195 total). Treat the timezone/DST explanation as a hypothesis, not a proven root cause. |
-| UI test | **NOT VERIFIED** | `/private/tmp/apple-notes-exporter-p3-ui-20261025.xcresult`; test worker did not establish a connection and the attempt was interrupted after about 150 seconds. No UI test is counted as passed. |
-| Isolated app build | **PASS** | Explicit project build succeeded in the preceding validation; the final app/unit run also compiled the current app sources. The final one-line PDF byte-accounting change was included in the app/unit run. |
-| Script and diff hygiene | **PASS** | `bash -n scripts/run-integration-app.sh`; `git diff --check`. |
-| Faithful/Study visual preview | **SYNTHETIC PREVIEW INSPECTED** | Rendered PDF page previews from the test result were inspected. This is not a live UI or real-Notes acceptance test. |
+| Focused corrected PDF-attachment regressions | **PASS — 9 passed, 0 failed, 0 skipped** | `/private/tmp/ANE-p3-correction-final-retest.log`; XCTest result `/private/tmp/ANE-p3-correction-derived/Logs/Test/Test-Apple Notes Exporter-2026.10.25_15-22-02-+0100.xcresult`; covers mode/marker order, cancellation, duplicate-ID conflict, filename collisions, qpdf round-trip and trailer preservation (`/Info`/`/ID`), Poppler extraction, no page expansion, both attachment modes crossed with both style profiles, and private same-volume delivery cleanup. |
+| Complete app unit target | **PARTIAL — 196 passed, 1 failed** | `/private/tmp/ANE-p3-correction-unit-final.log`; XCTest result `/private/tmp/ANE-p3-correction-derived/Logs/Test/Test-Apple Notes Exporter-2026.10.25_12-40-59-+0000.xcresult`; `TZ=UTC`, `MACOSX_DEPLOYMENT_TARGET=13.0`, signing disabled for this diagnostic run. Sole failure: `test_zipDirectory_preservesFileModificationDates`, expected `1400000000`, observed `1400003600` (+3600 seconds). No ZIP implementation was changed for P3-B; the UTC retry did not resolve it, and its root cause remains unproven. |
+| Independent reader-tool extraction | **PASS** | Poppler 26.10.0 `pdfdetach` listed and extracted the 3-page synthetic attachment byte-for-byte; Poppler `pdfinfo` reported 2 note pages. The test is skipped only where `pdfdetach` is absent. qpdf 12.4.2 checks and extraction also pass. |
+| Preview.app practical check | **PARTIAL** | macOS 27.0.1 Preview opened and rendered the 2-page synthetic note PDF. Its observed sidebar and Inspector exposed no EmbeddedFiles list or open/extract action; Preview extraction is therefore not verified and was unavailable through the observed UI. Fixture was writer-only and did not test the app-generated visual card. |
+| UI-test target | **NOT VERIFIED** | The earlier P3 attempt stalled before establishing a test connection; the target was not rerun during the Preview check. |
+| Xcode ⌘R launch diagnosis | **OPEN** | The stale-UI cause was not established. This session could not inspect native Xcode/project windows because the Mac was locked; the explicit integration launcher remains available. |
+| Faithful/Study visual inspection | **NOT PERFORMED AFTER THIS CORRECTION** | Automated tests cover text placement and page count in all mode/profile combinations, but no screenshot/visual review of the corrected compact cards was possible in the locked session. |
+| Build and target settings | **PASS WITH DIAGNOSTIC OVERRIDES** | The app/unit target compiled during `xcodebuild test`; the permanent deployment target remains 11.0. `MACOSX_DEPLOYMENT_TARGET=13.0` and signing overrides were command-line-only. |
+| Hygiene | **PASS** | `git diff --check`; script syntax is checked separately. No personal notes or attachments are test inputs. |
 
 The default build without the command-line override is blocked by the installed Xcode/macOS SDK rejecting the unchanged deployment target 11.0 (the SDK reports a supported range starting at 12.0). No permanent target change was made. F2/P2.2-E—whether Apple Notes' serialized Monostile data reliably distinguishes internal newlines from consecutive block boundaries—remains open and is not resolved by these P3 changes.
 
-### P3 changed files
+### Files changed for the P3-B correction in the current worktree diff
+
+- `Apple Notes Exporter/Apple Notes Exporter.xcodeproj/project.pbxproj`
+- `Apple Notes Exporter/Apple Notes Exporter/AppleNotesExporterView.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ExportSupport.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/HTMLAttachmentProcessor.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/Models/ExportConfiguration.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/PDFEmbeddedFileWriter.swift`
+- `Apple Notes Exporter/Apple Notes Exporter/ViewModels/ExportViewModel.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/EngineParityTests.swift`
+- `Apple Notes Exporter/Apple Notes ExporterTests/ExportSupportTests.swift`
+- `docs/notes-to-pdf/ARCHITECTURE.md`
+- `docs/notes-to-pdf/README.md`
+- `docs/notes-to-pdf/INTEGRATION_REPORT.md`
+
+### P3 changed files (earlier P3-A/P3-C work)
 
 - `Apple Notes Exporter/Apple Notes Exporter/AppleNotesExporterApp.swift`
 - `Apple Notes Exporter/Apple Notes Exporter/ExportSupport.swift`

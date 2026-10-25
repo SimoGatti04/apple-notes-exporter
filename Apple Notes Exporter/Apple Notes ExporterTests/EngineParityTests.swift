@@ -34,6 +34,44 @@ import SQLite3
 ///
 /// It runs against a generated legacy-schema database, so it needs no Notes
 /// library and no Full Disk Access.
+private enum SyntheticPDFRepositoryError: Error {
+    case invalidPDF
+    case unexpectedCall
+    case ownershipMismatch
+    case missingAttachment
+}
+
+private final class SyntheticPDFAttachmentRepository: NotesRepository {
+    private let ownerNoteID: String
+    private let attachmentData: [String: Data]
+
+    init(ownerNoteID: String, attachmentData: [String: Data]) {
+        self.ownerNoteID = ownerNoteID
+        self.attachmentData = attachmentData
+    }
+
+    func fetchAccounts() async throws -> [NotesAccount] { throw SyntheticPDFRepositoryError.unexpectedCall }
+    func fetchFolders() async throws -> [NotesFolder] { throw SyntheticPDFRepositoryError.unexpectedCall }
+    func fetchNotes(includeDeleted: Bool) async throws -> [NotesNote] { throw SyntheticPDFRepositoryError.unexpectedCall }
+    func fetchAttachment(id: String) async throws -> Data { throw SyntheticPDFRepositoryError.unexpectedCall }
+
+    func fetchAttachment(id: String, ownedByNoteID noteID: String) async throws -> Data {
+        guard noteID == ownerNoteID else { throw SyntheticPDFRepositoryError.ownershipMismatch }
+        guard let data = attachmentData[id] else { throw SyntheticPDFRepositoryError.missingAttachment }
+        return data
+    }
+
+    func fetchAttachmentFilename(id: String) async -> String? { nil }
+    func fetchGalleryChildren(galleryId: String, accountId: String?) async throws -> [GalleryChild] {
+        throw SyntheticPDFRepositoryError.unexpectedCall
+    }
+    func generateHTML(forNoteId noteId: String) async throws -> String { throw SyntheticPDFRepositoryError.unexpectedCall }
+    func fetchHierarchy(sortBy: NoteSortOption, foldersOnTop: Bool) async throws -> NotesHierarchy {
+        throw SyntheticPDFRepositoryError.unexpectedCall
+    }
+    func invalidateCache() {}
+}
+
 @MainActor
 final class EngineParityTests: XCTestCase {
 
@@ -398,6 +436,7 @@ final class EngineParityTests: XCTestCase {
         let existingPDF = output.appendingPathComponent("Flat Note.pdf")
         let sentinel = Data("existing user file".utf8)
         try sentinel.write(to: existingPDF)
+        let outputEntriesBeforeDelivery = Set(try FileManager.default.contentsOfDirectory(atPath: output.path))
         let stagedPDF = staging.appendingPathComponent("rendered.pdf")
         let generatedBytes = Data("generated PDF bytes".utf8)
         try generatedBytes.write(to: stagedPDF)
@@ -412,6 +451,11 @@ final class EngineParityTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: existingPDF), sentinel)
         XCTAssertEqual(try Data(contentsOf: deliveredURL), generatedBytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: stagedPDF.path))
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: output.path)),
+            outputEntriesBeforeDelivery.union([deliveredURL.lastPathComponent]),
+            "The private same-volume staging directory should be cleaned after atomic delivery"
+        )
     }
 
     func test_singleNotePDFNeverOverwritesAndUsesStableCollisionSuffixes() async throws {
@@ -788,6 +832,128 @@ final class EngineParityTests: XCTestCase {
             mismatches.isEmpty,
             "The app and the CLI disagree on packaged output:\n" + mismatches.joined(separator: "\n")
         )
+    }
+
+    private func makeSyntheticPDF(pageCount: Int) throws -> Data {
+        let data = NSMutableData()
+        var mediaBox = CGRect(x: 0, y: 0, width: 320, height: 420)
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw SyntheticPDFRepositoryError.invalidPDF
+        }
+        for index in 0..<pageCount {
+            context.beginPDFPage([kCGPDFContextMediaBox: mediaBox] as CFDictionary)
+            let color = [
+                CGColor(red: 0.85, green: 0.20, blue: 0.18, alpha: 1),
+                CGColor(red: 0.18, green: 0.70, blue: 0.35, alpha: 1),
+                CGColor(red: 0.16, green: 0.34, blue: 0.86, alpha: 1)
+            ][index % 3]
+            context.setFillColor(color)
+            context.fill(mediaBox)
+            context.endPDFPage()
+        }
+        context.closePDF()
+        return data as Data
+    }
+
+    private func qpdfOutput(_ arguments: [String], executable: URL) throws -> Data {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let output = Pipe()
+        let errorOutput = Pipe()
+        process.standardOutput = output
+        process.standardError = errorOutput
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let diagnostics = errorOutput.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            "qpdf \(arguments.joined(separator: " ")) failed: \(String(decoding: diagnostics, as: UTF8.self))"
+        )
+        return data
+    }
+
+    func test_standalonePDFKeepsPDFsAsExtractableAttachmentsInBothModes() async throws {
+        let attachmentID = "synthetic-source-pdf"
+        let attachmentBytes = try makeSyntheticPDF(pageCount: 3)
+        let attachment = NotesAttachment(id: attachmentID, typeUTI: "com.adobe.pdf", filename: "synthetic-source.pdf")
+        let output = try makeOutputDirectory()
+        let qpdfPath = ["/opt/homebrew/bin/qpdf", "/usr/local/bin/qpdf", "/usr/bin/qpdf"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+        let qpdf = qpdfPath.map(URL.init(fileURLWithPath:))
+        var scenarioIndex = 0
+
+        for mode in PDFAttachmentMode.allCases {
+            for style in PDFStyleProfile.allCases {
+                let index = scenarioIndex
+                scenarioIndex += 1
+                let scenario = "\(mode.rawValue)/\(style.rawValue)"
+                let baselineID = "baseline-\(index)"
+                let baseline = ExportViewModel(
+                    repository: SyntheticPDFAttachmentRepository(ownerNoteID: baselineID, attachmentData: [:]),
+                    databasePath: "/private/tmp/ane-no-notes-db-\(UUID().uuidString)"
+                )
+                baseline.configurations.pdf.styleProfile = style
+                baseline.configurations.pdf.attachmentMode = mode
+                await baseline.exportSingleNotePDF(
+                    makeNote(id: baselineID, title: "Baseline \(index)", htmlBody: "<p>Before</p><p>After</p>"),
+                    toDirectory: output
+                )
+                guard case .completed = baseline.exportState, let baselineURL = baseline.lastExportArtifactURL,
+                      let baselinePDF = PDFDocument(url: baselineURL) else {
+                    return XCTFail("Expected the synthetic baseline note to render: \(baseline.exportLog)")
+                }
+
+                let noteID = "attached-note-\(index)"
+                let marker = "<p>Before</p><span data-attachment-id=\"\(attachmentID)\" data-attachment-type=\"com.adobe.pdf\">[PDF]</span><p>After</p>"
+                let viewModel = ExportViewModel(
+                    repository: SyntheticPDFAttachmentRepository(ownerNoteID: noteID, attachmentData: [attachmentID: attachmentBytes]),
+                    databasePath: "/private/tmp/ane-no-notes-db-\(UUID().uuidString)"
+                )
+                viewModel.configurations.pdf.styleProfile = style
+                viewModel.configurations.pdf.attachmentMode = mode
+                await viewModel.exportSingleNotePDF(
+                    makeNote(id: noteID, title: "Attached \(index)", htmlBody: marker, attachments: [attachment]),
+                    toDirectory: output
+                )
+                guard case let .completed(statistics) = viewModel.exportState,
+                      let outputURL = viewModel.lastExportArtifactURL,
+                      let exportedPDF = PDFDocument(url: outputURL) else {
+                    return XCTFail("Expected the synthetic attachment export to render: \(viewModel.exportLog)")
+                }
+
+                XCTAssertEqual(statistics.failedAttachments, 0, viewModel.exportLog.joined(separator: "\n"))
+                XCTAssertEqual(exportedPDF.pageCount, baselinePDF.pageCount,
+                               "The source PDF's three pages must not be appended to the note page tree (\(scenario))")
+                XCTAssertEqual(exportedPDF.pageCount, 1)
+                guard let notePage = exportedPDF.page(at: 0),
+                      let beforeBounds = exportedPDF.findString("Before", withOptions: []).first?.bounds(for: notePage),
+                      let attachmentBounds = exportedPDF.findString("synthetic-source.pdf", withOptions: []).first?.bounds(for: notePage),
+                      let afterBounds = exportedPDF.findString("After", withOptions: []).first?.bounds(for: notePage) else {
+                    return XCTFail("The note text and attachment reference must all render in \(scenario)")
+                }
+                // PDFKit's extracted string order is not a visual-order contract;
+                // compare rendered coordinates instead (PDF origin is bottom-left).
+                XCTAssertGreaterThan(beforeBounds.midY, attachmentBounds.midY,
+                                     "The attachment reference moved before its note marker in \(scenario)")
+                XCTAssertGreaterThan(attachmentBounds.midY, afterBounds.midY,
+                                     "The attachment reference moved after its following text in \(scenario)")
+
+                if let qpdf {
+                    _ = try qpdfOutput(["--check", outputURL.path], executable: qpdf)
+                    let listing = String(decoding: try qpdfOutput(["--list-attachments", outputURL.path], executable: qpdf), as: UTF8.self)
+                    XCTAssertTrue(listing.contains("synthetic-source.pdf"), listing)
+                    XCTAssertEqual(
+                        try qpdfOutput(["--show-attachment=synthetic-source.pdf", outputURL.path], executable: qpdf),
+                        attachmentBytes,
+                        "Reader extraction must preserve the original attachment bytes exactly in \(scenario)"
+                    )
+                }
+            }
+        }
     }
 
     /// The names of the files inside a zip container, or empty if it is not one.

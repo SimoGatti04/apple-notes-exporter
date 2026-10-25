@@ -22,6 +22,7 @@ import Foundation
 import SQLite3
 import OSLog
 import AppKit
+import PDFKit
 
 struct AttachmentMarkerFallbackResult {
     let html: String
@@ -47,6 +48,9 @@ class HTMLAttachmentProcessor {
     private(set) var embeddedPDFInsertions: [PDFHTMLAttachmentInsertion] = []
     private(set) var unplaceablePDFAttachmentIDs: Set<String> = []
     private var verifiedPDFDataByID: [String: Data] = [:]
+    private var pdfPreviewDataByID: [String: Data] = [:]
+    private var invalidPDFIDs: Set<String> = []
+    private var pdfAttachmentMode: PDFAttachmentMode = .previewAndEmbed
 
     init(database: OpaquePointer) {
         self.db = database
@@ -68,7 +72,10 @@ class HTMLAttachmentProcessor {
         in html: String,
         attachments: [NotesAttachment],
         reason: String,
-        verifiedPDFDataByID: [String: Data] = [:]
+        verifiedPDFDataByID: [String: Data] = [:],
+        pdfPreviewDataByID: [String: Data] = [:],
+        invalidPDFIDs: Set<String> = [],
+        pdfAttachmentMode: PDFAttachmentMode = .previewAndEmbed
     ) -> AttachmentMarkerFallbackResult {
         let pattern = #"<span\s+data-attachment-id="([^"]+)"\s+data-attachment-type="([^"]+)">.*?</span>"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
@@ -99,7 +106,23 @@ class HTMLAttachmentProcessor {
             if typeIsPDF, attachment != nil, let data = verifiedPDFDataByID[identifier] {
                 let insertion = PDFHTMLAttachmentInsertion(attachmentID: identifier, filename: label, data: data)
                 embeddedPDFInsertions.append(insertion)
-                result = (result as NSString).replacingCharacters(in: fullRange, with: insertion.markerHTML)
+                let validPDF = !invalidPDFIDs.contains(identifier)
+                let preview = validPDF && pdfAttachmentMode == .previewAndEmbed
+                    ? (pdfPreviewDataByID[identifier] ?? pdfPreviewData(from: data))
+                    : nil
+                result = (result as NSString).replacingCharacters(
+                    in: fullRange,
+                    with: pdfAttachmentCardHTML(
+                        filename: label,
+                        mode: pdfAttachmentMode,
+                        previewData: preview,
+                        isValidPDF: validPDF
+                    )
+                )
+                if !validPDF {
+                    incompleteIDs.insert(identifier)
+                    diagnostics.append("PDF attachment '\(label)' appears damaged; its original bytes were preserved, but the reader may not open it.")
+                }
                 continue
             }
             if typeIsPDF { unplaceablePDFIDs.insert(identifier) }
@@ -122,9 +145,53 @@ class HTMLAttachmentProcessor {
             html: result,
             incompleteAttachmentIDs: incompleteIDs,
             diagnostics: diagnostics,
-            embeddedPDFInsertions: embeddedPDFInsertions,
+            embeddedPDFInsertions: Array(embeddedPDFInsertions.reversed()),
             unplaceablePDFAttachmentIDs: unplaceablePDFIDs
         )
+    }
+
+    static func pdfPreviewData(from data: Data) -> Data? {
+        guard let document = PDFDocument(data: data), !document.isLocked,
+              document.pageCount > 0, let firstPage = document.page(at: 0) else { return nil }
+        let thumbnail = firstPage.thumbnail(of: CGSize(width: 112, height: 144), for: .mediaBox)
+        guard let tiff = thumbnail.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private static func pdfAttachmentCardHTML(
+        filename: String,
+        mode: PDFAttachmentMode,
+        previewData: Data?,
+        isValidPDF: Bool
+    ) -> String {
+        let previewHTML: String
+        if mode == .previewAndEmbed, let previewData {
+            previewHTML = "<img class=\"ane-pdf-attachment-preview\" src=\"data:image/png;base64,\(previewData.base64EncodedString())\" alt=\"First-page preview of \(filename.htmlEscaped)\">"
+        } else {
+            previewHTML = ""
+        }
+        let status: String
+        if !isValidPDF {
+            status = "<small class=\"ane-pdf-attachment-status\">Original bytes are attached, but this PDF appears damaged and may not open.</small>"
+        } else if mode == .previewAndEmbed && previewData == nil {
+            status = "<small class=\"ane-pdf-attachment-status\">Preview unavailable; original PDF is attached.</small>"
+        } else {
+            // In embed-only mode a successful card intentionally contains only
+            // its compact PDF icon and filename; the preference description
+            // explains how to open or extract the embedded original.
+            status = ""
+        }
+        return """
+        <figure class=\"ane-pdf-attachment-card\" data-ane-pdf-attachment=\"true\">
+            \(previewHTML)
+            <figcaption>
+                <span class=\"ane-pdf-attachment-icon\" aria-hidden=\"true\">PDF</span>
+                <span class=\"ane-pdf-attachment-name\">\(filename.htmlEscaped)</span>
+                \(status)
+            </figcaption>
+        </figure>
+        """
     }
 
     static func isPDFType(_ typeUTI: String) -> Bool {
@@ -161,11 +228,17 @@ class HTMLAttachmentProcessor {
         embedImages: Bool,
         linkEmbeddedImages: Bool,
         standalonePDF: Bool = false,
-        verifiedPDFDataByID: [String: Data] = [:]
+        verifiedPDFDataByID: [String: Data] = [:],
+        pdfPreviewDataByID: [String: Data] = [:],
+        invalidPDFIDs: Set<String> = [],
+        pdfAttachmentMode: PDFAttachmentMode = .previewAndEmbed
     ) -> String {
         // Store export directory for later use
         self.exportDirectory = exportDirectory
         self.verifiedPDFDataByID = verifiedPDFDataByID
+        self.pdfPreviewDataByID = pdfPreviewDataByID
+        self.invalidPDFIDs = invalidPDFIDs
+        self.pdfAttachmentMode = pdfAttachmentMode
         self.embeddedPDFInsertions.removeAll()
         self.unplaceablePDFAttachmentIDs.removeAll()
         self.incompleteAttachmentIDs.removeAll()
@@ -207,6 +280,9 @@ class HTMLAttachmentProcessor {
             }
         }
 
+        // Marker replacements are applied backwards to keep NSString ranges
+        // stable; restore the note order for the document-level attachment tree.
+        embeddedPDFInsertions.reverse()
         return processedHTML
     }
 
@@ -329,20 +405,33 @@ class HTMLAttachmentProcessor {
         // Check if this is a PDF
         if Self.isPDFType(attachment.typeUTI) {
             if standalonePDF {
+                let filename = attachment.filename ?? "PDF document"
                 if let data = verifiedPDFDataByID[uuid] {
                     let insertion = PDFHTMLAttachmentInsertion(
                         attachmentID: uuid,
-                        filename: attachment.filename ?? "PDF document",
+                        filename: filename,
                         data: data
                     )
                     embeddedPDFInsertions.append(insertion)
-                    return insertion.markerHTML
+                    let validPDF = !invalidPDFIDs.contains(uuid)
+                    let preview = validPDF && pdfAttachmentMode == .previewAndEmbed
+                        ? (pdfPreviewDataByID[uuid] ?? Self.pdfPreviewData(from: data))
+                        : nil
+                    if !validPDF {
+                        markIncomplete(attachment, reason: "the original bytes were preserved, but the attached PDF appears damaged or locked and may not open")
+                    }
+                    return Self.pdfAttachmentCardHTML(
+                        filename: filename,
+                        mode: pdfAttachmentMode,
+                        previewData: preview,
+                        isValidPDF: validPDF
+                    )
                 }
-                markIncomplete(attachment, reason: "owner-verified PDF bytes were not available")
+                markIncomplete(attachment, reason: "owner-verified PDF bytes were unavailable, over the safety limit, or could not be read")
                 unplaceablePDFAttachmentIDs.insert(attachment.id)
                 return Self.standaloneFileReferenceHTML(
-                    filename: attachment.filename ?? "PDF document",
-                    description: "Original PDF pages could not be placed in this PDF"
+                    filename: filename,
+                    description: "Original PDF could not be embedded; no attachment bytes are available"
                 )
             }
             return generatePDFLinkHTML(attachment: attachment, relativePath: relativePath)

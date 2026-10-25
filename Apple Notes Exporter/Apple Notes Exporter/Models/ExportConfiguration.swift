@@ -181,23 +181,49 @@ struct HTMLConfiguration: ExportConfigurable {
 
 // MARK: - PDF Configuration
 
+enum PDFAttachmentMode: String, Codable, CaseIterable, Identifiable {
+    case previewAndEmbed
+    case embedOnly
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .previewAndEmbed: return "Preview + embed"
+        case .embedOnly: return "Embed only"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .previewAndEmbed:
+            return "Show a compact first-page preview and embed the original PDF. Opening or extracting it requires a PDF reader that supports embedded attachments."
+        case .embedOnly:
+            return "Show only a compact file reference and embed the original PDF without generating a preview. Opening or extracting it requires a PDF reader that supports embedded attachments."
+        }
+    }
+}
+
 struct PDFConfiguration: ExportConfigurable {
     var htmlConfiguration: HTMLConfiguration
     var pageSize: PageSize
     var styleProfile: PDFStyleProfile
+    var attachmentMode: PDFAttachmentMode
 
     private enum CodingKeys: String, CodingKey {
-        case htmlConfiguration, pageSize, styleProfile
+        case htmlConfiguration, pageSize, styleProfile, attachmentMode
     }
 
     init(
         htmlConfiguration: HTMLConfiguration,
         pageSize: PageSize,
-        styleProfile: PDFStyleProfile = .study
+        styleProfile: PDFStyleProfile = .study,
+        attachmentMode: PDFAttachmentMode = .previewAndEmbed
     ) {
         self.htmlConfiguration = htmlConfiguration
         self.pageSize = pageSize
         self.styleProfile = styleProfile
+        self.attachmentMode = attachmentMode
     }
 
     init(from decoder: Decoder) throws {
@@ -206,6 +232,8 @@ struct PDFConfiguration: ExportConfigurable {
         pageSize = try container.decode(PageSize.self, forKey: .pageSize)
         // Configurations saved before PDF profiles were introduced remain valid.
         styleProfile = try container.decodeIfPresent(PDFStyleProfile.self, forKey: .styleProfile) ?? .study
+        // Existing configurations retain the requested compact-preview default.
+        attachmentMode = try container.decodeIfPresent(PDFAttachmentMode.self, forKey: .attachmentMode) ?? .previewAndEmbed
     }
 
     func encode(to encoder: Encoder) throws {
@@ -213,6 +241,7 @@ struct PDFConfiguration: ExportConfigurable {
         try container.encode(htmlConfiguration, forKey: .htmlConfiguration)
         try container.encode(pageSize, forKey: .pageSize)
         try container.encode(styleProfile, forKey: .styleProfile)
+        try container.encode(attachmentMode, forKey: .attachmentMode)
     }
 
     enum PageSize: String, Codable, CaseIterable {

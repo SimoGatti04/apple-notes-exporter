@@ -33,7 +33,6 @@ enum ExportError: Error, LocalizedError {
     case tooManyPDFNameCollisions
     case pdfNavigationFailed(String)
     case invalidGeneratedPDF
-    case pdfAttachmentCouldNotBePlaced(String)
     case pdfPrintFailed(String)
 
     var errorDescription: String? {
@@ -48,8 +47,6 @@ enum ExportError: Error, LocalizedError {
             return "Could not load note content for PDF rendering: \(message)"
         case .invalidGeneratedPDF:
             return "The PDF renderer produced an invalid or empty document."
-        case .pdfAttachmentCouldNotBePlaced(let name):
-            return "PDF attachment '\(name)' could not be placed safely; no incomplete export was written."
         case .pdfPrintFailed(let message):
             return "AppKit could not finish PDF printing: \(message)"
         }
@@ -271,8 +268,9 @@ class ExportViewModel: ObservableObject {
     /// flat-PDF export. The IDs let multiple diagnostics for one attachment be
     /// reported without inflating the final partial-failure count.
     private var flatPDFIncompleteAttachmentIDs: Set<String> = []
-    private var flatPDFUnplaceableAttachmentIDs: Set<String> = []
     private var flatPDFVerifiedDataByID: [String: Data] = [:]
+    private var flatPDFPreviewDataByID: [String: Data] = [:]
+    private var flatPDFInvalidPDFIDs: Set<String> = []
     private var flatPDFInsertions: [PDFHTMLAttachmentInsertion] = []
 
     /// WebViews currently owned by structured PDF rendering tasks. Cancellation
@@ -337,6 +335,7 @@ class ExportViewModel: ObservableObject {
     /// area. Only a URL returned by `createFlatPDFStagingDirectory` may be
     /// passed to the matching cleanup helper.
     private static let flatPDFStagingDirectoryPrefix = "apple-notes-exporter-pdf-"
+    private static let flatPDFDeliveryStagingDirectoryPrefix = ".apple-notes-exporter-pdf-delivery-"
 
     private static func createFlatPDFStagingDirectory(
         under temporaryRoot: URL = FileManager.default.temporaryDirectory,
@@ -645,8 +644,9 @@ class ExportViewModel: ObservableObject {
         failedNotesCount = 0
         failedAttachmentsCount = 0
         flatPDFIncompleteAttachmentIDs = []
-        flatPDFUnplaceableAttachmentIDs = []
         flatPDFVerifiedDataByID = [:]
+        flatPDFPreviewDataByID = [:]
+        flatPDFInvalidPDFIDs = []
         flatPDFInsertions = []
         internalLinkMap = [:]
         lastExportArtifactURL = nil
@@ -663,6 +663,8 @@ class ExportViewModel: ObservableObject {
             }
             internalLinkMap = [:]
             flatPDFVerifiedDataByID = [:]
+            flatPDFPreviewDataByID = [:]
+            flatPDFInvalidPDFIDs = []
             flatPDFInsertions = []
         }
 
@@ -689,22 +691,46 @@ class ExportViewModel: ObservableObject {
                 }
             }
             var totalPDFBytes = 0
-            var totalPDFPages = 0
             for attachment in uniquePDFAttachments {
                 try Task.checkCancellation()
                 if shouldCancel { throw CancellationError() }
                 let name = attachment.filename ?? attachment.name
-                let data = try await repository.fetchAttachment(id: attachment.id, ownedByNoteID: note.id)
-                let document = try PDFHTMLSequenceComposer.validatedAttachmentDocument(
-                    from: data,
-                    filename: name,
-                    alreadyIncludedBytes: totalPDFBytes,
-                    alreadyIncludedPages: totalPDFPages
-                )
-                totalPDFBytes += data.count
-                totalPDFPages += document.pageCount
-                flatPDFVerifiedDataByID[attachment.id] = data
-                log("Verified PDF attachment ‘\(name)’ (\(document.pageCount) page(s)) for this note")
+                do {
+                    let data = try await repository.fetchAttachment(id: attachment.id, ownedByNoteID: note.id)
+                    guard data.count <= PDFEmbeddedFileWriter.maximumAttachmentBytes else {
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ exceeds the per-file limit and will appear as an unavailable reference.")
+                        continue
+                    }
+                    let total = totalPDFBytes.addingReportingOverflow(data.count)
+                    guard !total.overflow, total.partialValue <= PDFEmbeddedFileWriter.maximumTotalAttachmentBytes else {
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ exceeds the combined attachment limit and will appear as an unavailable reference.")
+                        continue
+                    }
+                    totalPDFBytes = total.partialValue
+                    flatPDFVerifiedDataByID[attachment.id] = data
+
+                    if let document = PDFDocument(data: data), !document.isLocked, document.pageCount > 0 {
+                        log("Verified original PDF bytes for ‘\(name)’; the attachment’s pages will not be added to the note PDF.")
+                        if configurations.pdf.attachmentMode == .previewAndEmbed {
+                            if let preview = HTMLAttachmentProcessor.pdfPreviewData(from: data) {
+                                flatPDFPreviewDataByID[attachment.id] = preview
+                            } else {
+                                log("⚠︎ A compact preview could not be rendered for ‘\(name)’; the original file will still be embedded.")
+                            }
+                        }
+                    } else {
+                        flatPDFInvalidPDFIDs.insert(attachment.id)
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ appears damaged or locked; its original bytes will be embedded without a preview, but the reader may not open it.")
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                    log("⚠︎ PDF attachment ‘\(name)’ is missing or could not be read; an unavailable reference will remain in the note.")
+                }
             }
 
             var attachmentPaths: [String: String] = [:]
@@ -759,43 +785,49 @@ class ExportViewModel: ObservableObject {
                 standalonePDF: true
             )
 
-            if let unplaceableID = flatPDFUnplaceableAttachmentIDs.first {
-                let name = note.attachments.first(where: { $0.id == unplaceableID })?.filename ?? unplaceableID
-                throw ExportError.pdfAttachmentCouldNotBePlaced(name)
-            }
-
             let stagedPDF = staging.appendingPathComponent("rendered.pdf")
             let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
             log("Rendering standalone PDF...")
-            if flatPDFInsertions.isEmpty {
-                let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
-                try await renderPDFHTML(
-                    paginatedHTML,
+            let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: stagedPDF,
+                pageSize: pageSizeCG,
+                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+            )
+
+            var stagedPDFForDelivery = stagedPDF
+            if !flatPDFInsertions.isEmpty {
+                try Task.checkCancellation()
+                if shouldCancel { throw CancellationError() }
+                let attachedPDF = staging.appendingPathComponent("rendered-with-attachments.pdf")
+                let result = try PDFEmbeddedFileWriter.addAttachments(
+                    flatPDFInsertions,
                     to: stagedPDF,
-                    pageSize: pageSizeCG,
-                    margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-                )
-            } else {
-                try await renderPDFHTMLSequence(
-                    html,
-                    insertions: flatPDFInsertions,
-                    to: stagedPDF,
-                    stagingDirectory: staging,
-                    pageSize: pageSizeCG
-                )
+                    writingTo: attachedPDF
+                ) {
+                    try Task.checkCancellation()
+                    if self.shouldCancel { throw CancellationError() }
+                }
+                guard let renderedDocument = PDFDocument(url: stagedPDF),
+                      result.pageCount == renderedDocument.pageCount else {
+                    throw PDFEmbeddedFileWriterError.invalidOutputPDF
+                }
+                stagedPDFForDelivery = attachedPDF
+                log("Embedded \(result.embeddedFileCount) unique PDF attachment(s); note page count remains \(result.pageCount).")
             }
 
             try Task.checkCancellation()
             if shouldCancel { throw CancellationError() }
 
             try setExportFileTimestamps(
-                stagedPDF,
+                stagedPDFForDelivery,
                 creationDate: note.creationDate,
                 modificationDate: note.modificationDate
             )
 
             let finalURL = try Self.moveFlatPDFWithoutOverwriting(
-                stagedPDF,
+                stagedPDFForDelivery,
                 noteTitle: note.title,
                 toDirectory: destinationDirectory
             )
@@ -844,56 +876,6 @@ class ExportViewModel: ObservableObject {
     /// output files. If WebKit is unresponsive during PDF capture, cancellation
     /// may take until WebKit completes; we deliberately do not return while it
     /// can still be rendering.
-    private func renderPDFHTMLSequence(
-        _ html: String,
-        insertions: [PDFHTMLAttachmentInsertion],
-        to outputURL: URL,
-        stagingDirectory: URL,
-        pageSize: CGSize
-    ) async throws {
-        let parts = try PDFHTMLSequenceComposer.parts(html: html, insertions: insertions)
-        var documents: [PDFDocument] = []
-        var insertedPDFBytes = 0
-        var insertedPageCount = 0
-
-        for (index, part) in parts.enumerated() {
-            try Task.checkCancellation()
-            if shouldCancel { throw CancellationError() }
-            switch part {
-            case .html(let fragment):
-                let segmentURL = stagingDirectory.appendingPathComponent("rendered-segment-\(index).pdf")
-                let paginated = pdfHTMLWithPageGeometry(fragment, pageSize: pageSize)
-                try await renderPDFHTML(
-                    paginated,
-                    to: segmentURL,
-                    pageSize: pageSize,
-                    margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-                )
-                guard let document = PDFDocument(url: segmentURL), document.pageCount > 0 else {
-                    throw ExportError.invalidGeneratedPDF
-                }
-                documents.append(document)
-
-            case .attachment(let insertion):
-                let source = try PDFHTMLSequenceComposer.validatedAttachmentDocument(
-                    from: insertion.data,
-                    filename: insertion.filename,
-                    alreadyIncludedBytes: insertedPDFBytes,
-                    alreadyIncludedPages: insertedPageCount
-                )
-                insertedPDFBytes += insertion.data.count
-                insertedPageCount += source.pageCount
-                documents.append(source)
-            }
-        }
-
-        guard !documents.isEmpty else { throw ExportError.invalidGeneratedPDF }
-        try PDFHTMLSequenceComposer.write(documents: documents, to: outputURL) {
-            try Task.checkCancellation()
-            if self.shouldCancel { throw CancellationError() }
-        }
-    }
-
     private func renderPDFHTML(
         _ html: String,
         to url: URL,
@@ -1093,6 +1075,49 @@ class ExportViewModel: ObservableObject {
         noteTitle: String,
         toDirectory destinationDirectory: URL
     ) throws -> URL {
+        let fileManager = FileManager.default
+        let deliveryStagingDirectory = destinationDirectory.appendingPathComponent(
+            flatPDFDeliveryStagingDirectoryPrefix + UUID().uuidString,
+            isDirectory: true
+        )
+        // Build a private, same-volume delivery stage. The main renderer can
+        // stage under the system temp directory (which may be on another
+        // volume); this final sibling move is therefore a rename, not a
+        // cross-volume copy that could expose a partially written destination.
+        try fileManager.createDirectory(
+            at: deliveryStagingDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? fileManager.removeItem(at: deliveryStagingDirectory) }
+
+        let directoryPermissions = try fileManager.attributesOfItem(atPath: deliveryStagingDirectory.path)[.posixPermissions] as? NSNumber
+        guard let directoryPermissions, directoryPermissions.intValue & 0o077 == 0 else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteNoPermissionError,
+                userInfo: [NSLocalizedDescriptionKey: "The destination volume cannot provide private staging for an atomic PDF write."]
+            )
+        }
+        let stagedPermissions = try fileManager.attributesOfItem(atPath: stagedPDF.path)[.posixPermissions] as? NSNumber
+        let deliveryPDF = deliveryStagingDirectory.appendingPathComponent("payload.pdf")
+        try fileManager.copyItem(at: stagedPDF, to: deliveryPDF)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: deliveryPDF.path)
+        let filePermissions = try fileManager.attributesOfItem(atPath: deliveryPDF.path)[.posixPermissions] as? NSNumber
+        guard let filePermissions, filePermissions.intValue & 0o077 == 0 else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteNoPermissionError,
+                userInfo: [NSLocalizedDescriptionKey: "The destination volume cannot protect the staged PDF during atomic delivery."]
+            )
+        }
+        if let stagedPermissions {
+            // Restore the renderer's normal output mode while the file is still
+            // inaccessible inside the private directory; preserve normal user
+            // access on the delivered PDF instead of forcing it to 0600.
+            try fileManager.setAttributes([.posixPermissions: stagedPermissions.intValue], ofItemAtPath: deliveryPDF.path)
+        }
+
         let baseName = safeFlatPDFBaseName(noteTitle)
 
         for collisionNumber in 1...10_000 {
@@ -1100,18 +1125,20 @@ class ExportViewModel: ObservableObject {
                 ? "\(baseName).pdf"
                 : "\(baseName) (\(collisionNumber)).pdf"
             let destination = destinationDirectory.appendingPathComponent(filename)
-            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            guard !fileManager.fileExists(atPath: destination.path) else { continue }
 
             do {
-                // FileManager's move fails when the destination already
-                // exists; it never silently replaces an existing PDF.
-                try FileManager.default.moveItem(at: stagedPDF, to: destination)
+                // Both paths are on the destination volume. FileManager refuses
+                // an existing destination, so the completed file appears in a
+                // single same-volume move and never replaces a user's PDF.
+                try fileManager.moveItem(at: deliveryPDF, to: destination)
+                try? fileManager.removeItem(at: stagedPDF)
                 return destination
             } catch {
                 // A competing export may have claimed the same name after
                 // the preflight check. Retry only if that exact path now
                 // exists; propagate unrelated I/O and permission failures.
-                if FileManager.default.fileExists(atPath: destination.path) { continue }
+                if fileManager.fileExists(atPath: destination.path) { continue }
                 throw error
             }
         }
@@ -1747,11 +1774,13 @@ class ExportViewModel: ObservableObject {
                         embedImages: htmlConfig.embedImagesInline,
                         linkEmbeddedImages: htmlConfig.linkEmbeddedImages,
                         standalonePDF: standalonePDF,
-                        verifiedPDFDataByID: standalonePDF ? flatPDFVerifiedDataByID : [:]
+                        verifiedPDFDataByID: standalonePDF ? flatPDFVerifiedDataByID : [:],
+                        pdfPreviewDataByID: standalonePDF ? flatPDFPreviewDataByID : [:],
+                        invalidPDFIDs: standalonePDF ? flatPDFInvalidPDFIDs : [],
+                        pdfAttachmentMode: configurations.pdf.attachmentMode
                     )
                     if standalonePDF {
                         flatPDFIncompleteAttachmentIDs.formUnion(processor.incompleteAttachmentIDs)
-                        flatPDFUnplaceableAttachmentIDs.formUnion(processor.unplaceablePDFAttachmentIDs)
                         flatPDFInsertions.append(contentsOf: processor.embeddedPDFInsertions)
                         for diagnostic in processor.diagnostics {
                             log("⚠︎ \(diagnostic)")
@@ -1765,7 +1794,10 @@ class ExportViewModel: ObservableObject {
                         in: linkRewrittenBody,
                         attachments: note.attachments,
                         reason: "The Notes database attachment handle was unavailable",
-                        verifiedPDFDataByID: flatPDFVerifiedDataByID
+                        verifiedPDFDataByID: flatPDFVerifiedDataByID,
+                        pdfPreviewDataByID: flatPDFPreviewDataByID,
+                        invalidPDFIDs: flatPDFInvalidPDFIDs,
+                        pdfAttachmentMode: configurations.pdf.attachmentMode
                     )
                 }
             } else if standalonePDF {
@@ -1773,7 +1805,10 @@ class ExportViewModel: ObservableObject {
                     in: linkRewrittenBody,
                     attachments: note.attachments,
                     reason: "The Notes database could not be opened to verify attachment data",
-                    verifiedPDFDataByID: flatPDFVerifiedDataByID
+                    verifiedPDFDataByID: flatPDFVerifiedDataByID,
+                    pdfPreviewDataByID: flatPDFPreviewDataByID,
+                    invalidPDFIDs: flatPDFInvalidPDFIDs,
+                    pdfAttachmentMode: configurations.pdf.attachmentMode
                 )
             }
         }
@@ -1796,7 +1831,15 @@ class ExportViewModel: ObservableObject {
                 // margins for this content. Apply the configured margin in CSS
                 // and pass zero to NSPrintInfo so it is applied exactly once.
                 embedPageMarginsInCSS: true,
-                showHeader: false
+                showHeader: false,
+                customCSS: """
+                .ane-pdf-attachment-card { display: flex; align-items: center; gap: 10px; max-width: 420px; margin: 9px 0 12px; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #f8fafc; break-inside: avoid; page-break-inside: avoid; }
+                .ane-pdf-attachment-preview { display: block; width: auto; height: auto; max-width: 80px; max-height: 108px; margin: 0 !important; object-fit: contain; border: 1px solid #e5e7eb; border-radius: 3px; box-shadow: none !important; }
+                .ane-pdf-attachment-card figcaption { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 8px; min-width: 0; }
+                .ane-pdf-attachment-icon { display: inline-block; padding: 2px 4px; border-radius: 3px; background: #b91c1c; color: white; font: 700 7pt -apple-system, sans-serif; }
+                .ane-pdf-attachment-name { overflow-wrap: anywhere; font-size: 9pt; font-weight: 600; }
+                .ane-pdf-attachment-status { grid-column: 1 / -1; color: #475569; font-size: 7pt; }
+                """
             )
             return notePDFHTMLDocument(
                 title: note.title,
@@ -1827,9 +1870,6 @@ class ExportViewModel: ObservableObject {
 
     private func recordFlatPDFAttachmentFailure(_ attachments: [NotesAttachment], reason: String) {
         flatPDFIncompleteAttachmentIDs.formUnion(attachments.map(\.id))
-        for attachment in attachments where HTMLAttachmentProcessor.isPDFType(attachment.typeUTI) {
-            flatPDFUnplaceableAttachmentIDs.insert(attachment.id)
-        }
         for attachment in attachments {
             let label = attachment.filename ?? attachment.id
             log("⚠︎ Attachment '\(label)' was not verified for the PDF: \(reason).")
@@ -1840,16 +1880,21 @@ class ExportViewModel: ObservableObject {
         in html: String,
         attachments: [NotesAttachment],
         reason: String,
-        verifiedPDFDataByID: [String: Data]
+        verifiedPDFDataByID: [String: Data],
+        pdfPreviewDataByID: [String: Data],
+        invalidPDFIDs: Set<String>,
+        pdfAttachmentMode: PDFAttachmentMode
     ) -> String {
         let fallback = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
             in: html,
             attachments: attachments,
             reason: reason,
-            verifiedPDFDataByID: verifiedPDFDataByID
+            verifiedPDFDataByID: verifiedPDFDataByID,
+            pdfPreviewDataByID: pdfPreviewDataByID,
+            invalidPDFIDs: invalidPDFIDs,
+            pdfAttachmentMode: pdfAttachmentMode
         )
         flatPDFIncompleteAttachmentIDs.formUnion(fallback.incompleteAttachmentIDs)
-        flatPDFUnplaceableAttachmentIDs.formUnion(fallback.unplaceablePDFAttachmentIDs)
         flatPDFInsertions.append(contentsOf: fallback.embeddedPDFInsertions)
         for diagnostic in fallback.diagnostics {
             log("⚠︎ \(diagnostic)")

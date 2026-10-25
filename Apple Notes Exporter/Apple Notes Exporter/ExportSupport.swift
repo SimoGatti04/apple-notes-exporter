@@ -34,184 +34,20 @@ extension Logger {
 }
 
 
-/// One verified PDF attachment occurrence, kept as a unique marker until the
-/// surrounding HTML has been rendered. The source PDF is never flattened to an image.
+/// One owner-verified PDF attachment occurrence. Repeated occurrences remain in
+/// the HTML at their original positions; the PDF writer de-duplicates the file
+/// payload by attachment ID when creating the document-level EmbeddedFiles tree.
 struct PDFHTMLAttachmentInsertion {
-    let token: String
     let attachmentID: String
     let filename: String
     let data: Data
 
     init(attachmentID: String, filename: String, data: Data) {
-        self.token = UUID().uuidString.lowercased()
         self.attachmentID = attachmentID
         self.filename = filename
         self.data = data
     }
-
-    var markerHTML: String {
-        "<div class=\"ane-pdf-attachment-marker\" data-ane-pdf-token=\"\(token)\"></div>"
-    }
 }
-
-enum PDFHTMLSequencePart {
-    case html(String)
-    case attachment(PDFHTMLAttachmentInsertion)
-}
-
-enum PDFHTMLSequenceError: Error, LocalizedError {
-    case malformedHTMLBody
-    case missingMarker(String)
-    case invalidAttachment(String)
-    case attachmentTooLarge(String)
-    case totalAttachmentBytesExceeded
-    case attachmentPageLimitExceeded(String)
-    case totalAttachmentPagesExceeded
-    case unableToWrite
-    case invalidComposedDocument
-
-    var errorDescription: String? {
-        switch self {
-        case .malformedHTMLBody:
-            return "The note HTML could not be divided safely around its PDF attachment."
-        case .missingMarker(let name):
-            return "The position of PDF attachment ‘\(name)’ could not be preserved."
-        case .invalidAttachment(let name):
-            return "PDF attachment ‘\(name)’ is empty, encrypted, corrupt, or unreadable."
-        case .attachmentTooLarge(let name):
-            return "PDF attachment ‘\(name)’ exceeds the 96 MiB per-file safety limit."
-        case .totalAttachmentBytesExceeded:
-            return "The PDF attachments in this note exceed the 256 MiB safety limit."
-        case .attachmentPageLimitExceeded(let name):
-            return "PDF attachment ‘\(name)’ exceeds the 500-page safety limit."
-        case .totalAttachmentPagesExceeded:
-            return "PDF attachments in this note exceed the 2,000-page safety limit."
-        case .unableToWrite:
-            return "The composed PDF pages could not be written safely."
-        case .invalidComposedDocument:
-            return "The composed PDF failed its integrity check."
-        }
-    }
-}
-
-/// Splits text/image HTML at verified PDF markers and joins rendered HTML pages
-/// with native PDF pages. PDFPage copies preserve source page geometry, rotation,
-/// text, vector drawing, and annotations instead of rasterizing them.
-enum PDFHTMLSequenceComposer {
-    static let maximumAttachmentBytes = 96 * 1024 * 1024
-    static let maximumTotalAttachmentBytes = 256 * 1024 * 1024
-    static let maximumPagesPerAttachment = 500
-    static let maximumTotalAttachmentPages = 2_000
-
-    static func validatedAttachmentDocument(
-        from data: Data,
-        filename: String,
-        alreadyIncludedBytes: Int = 0,
-        alreadyIncludedPages: Int = 0
-    ) throws -> PDFDocument {
-        guard data.count <= maximumAttachmentBytes else {
-            throw PDFHTMLSequenceError.attachmentTooLarge(filename)
-        }
-        let byteTotal = alreadyIncludedBytes.addingReportingOverflow(data.count)
-        guard !byteTotal.overflow, byteTotal.partialValue <= maximumTotalAttachmentBytes else {
-            throw PDFHTMLSequenceError.totalAttachmentBytesExceeded
-        }
-        guard data.count > 0, let document = PDFDocument(data: data), !document.isLocked, document.pageCount > 0 else {
-            throw PDFHTMLSequenceError.invalidAttachment(filename)
-        }
-        guard document.pageCount <= maximumPagesPerAttachment else {
-            throw PDFHTMLSequenceError.attachmentPageLimitExceeded(filename)
-        }
-        let pageTotal = alreadyIncludedPages.addingReportingOverflow(document.pageCount)
-        guard !pageTotal.overflow, pageTotal.partialValue <= maximumTotalAttachmentPages else {
-            throw PDFHTMLSequenceError.totalAttachmentPagesExceeded
-        }
-        return document
-    }
-
-    static func parts(
-        html: String,
-        insertions: [PDFHTMLAttachmentInsertion]
-    ) throws -> [PDFHTMLSequencePart] {
-        guard !insertions.isEmpty else { return [.html(html)] }
-        guard let bodyTag = html.range(of: "<body", options: [.caseInsensitive]),
-              let bodyTagEnd = html[bodyTag.upperBound...].firstIndex(of: ">"),
-              let bodyEnd = html.range(of: "</body>", options: [.caseInsensitive])?.lowerBound,
-              bodyTagEnd < bodyEnd else {
-            throw PDFHTMLSequenceError.malformedHTMLBody
-        }
-
-        let bodyStart = html.index(after: bodyTagEnd)
-        let bodyPrefix = String(html[..<bodyStart])
-        let bodySuffix = String(html[bodyEnd...])
-        var located: [(range: Range<String.Index>, insertion: PDFHTMLAttachmentInsertion)] = []
-        var seenTokens = Set<String>()
-
-        for insertion in insertions {
-            guard seenTokens.insert(insertion.token).inserted,
-                  let range = html.range(of: insertion.markerHTML, range: bodyStart..<bodyEnd),
-                  html.range(of: insertion.markerHTML, range: range.upperBound..<bodyEnd) == nil else {
-                throw PDFHTMLSequenceError.missingMarker(insertion.filename)
-            }
-            located.append((range, insertion))
-        }
-        located.sort { $0.range.lowerBound < $1.range.lowerBound }
-
-        var parts: [PDFHTMLSequencePart] = []
-        var cursor = bodyStart
-        for item in located {
-            let fragment = String(html[cursor..<item.range.lowerBound])
-            if !fragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                parts.append(.html(bodyPrefix + fragment + bodySuffix))
-            }
-            parts.append(.attachment(item.insertion))
-            cursor = item.range.upperBound
-        }
-        let finalFragment = String(html[cursor..<bodyEnd])
-        if !finalFragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(.html(bodyPrefix + finalFragment + bodySuffix))
-        }
-        return parts
-    }
-
-    /// Writes an ordered PDF sequence to a staging path. Callers supply a
-    /// cancellation check that is invoked before every copied page.
-    @discardableResult
-    static func write(
-        documents: [PDFDocument],
-        to url: URL,
-        cancellationCheck: () throws -> Void = {}
-    ) throws -> Int {
-        let combined = PDFDocument()
-        var copiedPageCount = 0
-        do {
-            for document in documents {
-                for pageIndex in 0..<document.pageCount {
-                    try cancellationCheck()
-                    guard let page = document.page(at: pageIndex),
-                          let copiedPage = page.copy() as? PDFPage else {
-                        throw PDFHTMLSequenceError.invalidComposedDocument
-                    }
-                    combined.insert(copiedPage, at: combined.pageCount)
-                    copiedPageCount += 1
-                }
-            }
-            guard copiedPageCount > 0, combined.pageCount == copiedPageCount,
-                  combined.write(to: url),
-                  let reopened = PDFDocument(url: url),
-                  reopened.pageCount == copiedPageCount else {
-                throw PDFHTMLSequenceError.invalidComposedDocument
-            }
-            try cancellationCheck()
-            return copiedPageCount
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            throw error
-        }
-    }
-}
-
-// MARK: - Notes database paths and TCC probe
 
 /// Login-user home directory. `NSHomeDirectory()` can point at a container
 /// in helper or sandbox contexts, which then fails to match the path TCC uses
@@ -1265,6 +1101,48 @@ public func pdfDocumentCSS(options: PDFDocumentOptions) -> String {
             break-inside: avoid !important;
             page-break-inside: avoid !important;
             margin: 8px 0;
+        }
+        .ane-pdf-attachment-card {
+            display: block;
+            margin: 8px 0;
+            padding: 10px;
+            border: 1px solid #d8d8d8;
+            border-radius: 6px;
+            color: #333;
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+        }
+        .ane-pdf-attachment-preview {
+            display: block;
+            width: auto;
+            max-width: 112px;
+            max-height: 144px;
+            object-fit: contain;
+            margin: 0 0 8px;
+        }
+        .ane-pdf-attachment-card figcaption {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+        }
+        .ane-pdf-attachment-icon {
+            display: inline-block;
+            padding: 2px 5px;
+            border: 1px solid #b9c5d1;
+            border-radius: 3px;
+            color: #31577b;
+            font-size: 0.75em;
+            font-weight: 700;
+        }
+        .ane-pdf-attachment-name {
+            overflow-wrap: anywhere;
+        }
+        .ane-pdf-attachment-status {
+            display: block;
+            margin-top: 4px;
+            color: #8a4b08;
+            font-size: 0.8em;
         }
 
         /* Paging utilities */
