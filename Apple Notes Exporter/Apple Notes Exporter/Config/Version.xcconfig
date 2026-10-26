@@ -3,5 +3,5 @@
 // bump is a one-line diff in a plain text file instead of six scattered edits
 // in the project file (which is CODEOWNERS-gated).
 
-MARKETING_VERSION = 2.1
+MARKETING_VERSION = 0.1.0
 CURRENT_PROJECT_VERSION = 1
