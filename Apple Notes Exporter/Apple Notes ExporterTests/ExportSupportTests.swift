@@ -18,10 +18,80 @@
 //  along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+import AppKit
+import CoreGraphics
+import PDFKit
 import XCTest
+import WebKit
 @testable import Apple_Notes_Exporter
 
+private enum SyntheticPDFTestError: Error {
+    case invalidDocument
+}
+
 final class ExportSupportTests: XCTestCase {
+    private func attachRenderedPagePreviews(_ document: PDFDocument, profile: String) throws {
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index),
+                  let tiff = page.thumbnail(of: CGSize(width: 595, height: 842), for: .mediaBox).tiffRepresentation else {
+                throw SyntheticPDFTestError.invalidDocument
+            }
+            let attachment = XCTAttachment(data: tiff, uniformTypeIdentifier: "public.tiff")
+            attachment.name = "\(profile)-page-\(index + 1)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
+    func test_pdfConfiguration_defaultsAndBackwardCompatibleDecoding() throws {
+        let defaultConfiguration = PDFConfiguration.defaultConfiguration
+        XCTAssertEqual(defaultConfiguration.styleProfile, .study)
+
+        let encoder = JSONEncoder()
+        let encoded = try encoder.encode(defaultConfiguration)
+        let roundTrip = try JSONDecoder().decode(PDFConfiguration.self, from: encoded)
+        XCTAssertEqual(roundTrip.styleProfile, .study)
+        XCTAssertEqual(roundTrip.pageSize, defaultConfiguration.pageSize)
+
+        let legacyJSON = """
+        {
+          "htmlConfiguration": {
+            "fontSizePoints": 14,
+            "fontFamily": "System",
+            "marginSize": 36,
+            "marginUnit": "pt",
+            "embedImagesInline": true,
+            "linkEmbeddedImages": false,
+            "writeFolderIndexes": false
+          },
+          "pageSize": "A4"
+        }
+        """
+        let legacy = try JSONDecoder().decode(PDFConfiguration.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(legacy.styleProfile, .study)
+        XCTAssertEqual(legacy.pageSize, .a4)
+    }
+
+    func test_folderOrganizationDefaultsFlatAndLegacyConfigurationDecodesFlat() throws {
+        XCTAssertEqual(ExportConfigurations.default.folderOrganization, .allTogether)
+
+        let current = try JSONEncoder().encode(ExportConfigurations.default)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: current) as? [String: Any])
+        object["folderOrganization"] = ExportFolderOrganization.asInNotes.rawValue
+        let selected = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ExportConfigurations.self, from: selected).folderOrganization,
+            .asInNotes
+        )
+
+        object.removeValue(forKey: "folderOrganization")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ExportConfigurations.self, from: legacy).folderOrganization,
+            .allTogether,
+            "Configurations saved before this preference must adopt the new flat default"
+        )
+    }
 
     // MARK: - HTML entity decoding
 
@@ -630,6 +700,128 @@ final class ExportSupportTests: XCTestCase {
             return XCTFail("expected a path mapping for the note")
         }
         XCTAssertNotEqual((rel as NSString).lastPathComponent.lowercased(), "index.html")
+    }
+
+    func test_flatAndNotesHierarchyPlacementsRemainDistinctAcrossAccountsAndFolders() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-folder-layout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = NotesNote(
+            id: "first", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "notes", accountId: "icloud", attachments: []
+        )
+        let second = NotesNote(
+            id: "second", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "work/projects", accountId: "icloud", attachments: []
+        )
+        let third = NotesNote(
+            id: "third", title: "Shared", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "notes", accountId: "local", attachments: []
+        )
+        let hierarchy = [
+            "iCloud": ["Notes": [first], "Work/Projects": [second]],
+            "On My Mac": ["Notes": [third]]
+        ]
+
+        let flat = flattenExportHierarchy(hierarchy, outputRoot: root, organization: .allTogether)
+        XCTAssertEqual(flat.count, 3)
+        XCTAssertTrue(flat.allSatisfy { $0.folderURL.standardizedFileURL == root.standardizedFileURL })
+
+        let mirrored = flattenExportHierarchy(hierarchy, outputRoot: root, organization: .asInNotes)
+        var folderByID: [String: String] = [:]
+        for placement in mirrored {
+            XCTAssertNil(
+                folderByID.updateValue(placement.folderURL.standardizedFileURL.path, forKey: placement.note.id),
+                "Synthetic fixture note IDs must remain unique"
+            )
+        }
+        XCTAssertEqual(folderByID["first"], root.appendingPathComponent("iCloud/Notes").standardizedFileURL.path)
+        XCTAssertEqual(folderByID["second"], root.appendingPathComponent("iCloud/Work/Projects").standardizedFileURL.path)
+        XCTAssertEqual(folderByID["third"], root.appendingPathComponent("On My Mac/Notes").standardizedFileURL.path)
+    }
+
+    func test_internalLinkAllocationReservesExistingNoteAndAttachmentSidecarNames() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-link-collision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("existing note".utf8).write(to: root.appendingPathComponent("Shared.pdf"))
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("Shared (Attachments)"), withIntermediateDirectories: true
+        )
+
+        func attachedNote(_ id: String) -> NotesNote {
+            NotesNote(
+                id: id, title: "Shared", plaintext: "", htmlBody: nil,
+                creationDate: Date(), modificationDate: Date(), folderId: "Notes", accountId: "iCloud",
+                attachments: [NotesAttachment(id: "synthetic-\(id)", typeUTI: "public.data", filename: "fixture.bin")]
+            )
+        }
+        let first = attachedNote("first")
+        let second = attachedNote("second")
+        let map = buildInternalLinkPathMap(
+            allNotes: [first, second],
+            notesWithPaths: [(note: first, folderURL: root), (note: second, folderURL: root)],
+            outputRoot: root, format: .pdf, addDatePrefix: false, dateFormat: "yyyy-MM-dd",
+            existingManifest: nil, includeAttachments: true, sharedAttachmentsFolder: false
+        )
+
+        XCTAssertEqual(map[first.id], "Shared (2).pdf")
+        XCTAssertEqual(map[second.id], "Shared (3).pdf")
+        let firstAttachmentFolder = attachmentExportLocation(
+            sharedDump: false, outputRoot: root, noteDirectory: root,
+            noteBaseName: "Shared (2)", filename: "fixture.bin"
+        ).directory
+        let secondAttachmentFolder = attachmentExportLocation(
+            sharedDump: false, outputRoot: root, noteDirectory: root,
+            noteBaseName: "Shared (3)", filename: "fixture.bin"
+        ).directory
+        XCTAssertEqual(firstAttachmentFolder.lastPathComponent, "Shared (2) (Attachments)")
+        XCTAssertEqual(secondAttachmentFolder.lastPathComponent, "Shared (3) (Attachments)")
+    }
+
+    func test_internalLinksFollowAllocatedPathsAcrossMirroredFolders() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-relative-link-\(UUID().uuidString)")
+        let sourceFolder = root.appendingPathComponent("Fixture/Notes", isDirectory: true)
+        let targetFolder = root.appendingPathComponent("Fixture/Work", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: targetFolder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        var source = NotesNote(
+            id: "source", title: "Source", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "Notes", accountId: "Fixture", attachments: []
+        )
+        source.identifier = "11111111-1111-1111-1111-111111111111"
+        var target = NotesNote(
+            id: "target", title: "Target", plaintext: "", htmlBody: nil,
+            creationDate: Date(), modificationDate: Date(), folderId: "Work", accountId: "Fixture", attachments: []
+        )
+        target.identifier = "22222222-2222-2222-2222-222222222222"
+
+        let map = buildInternalLinkPathMap(
+            allNotes: [source, target],
+            notesWithPaths: [
+                (note: source, folderURL: sourceFolder),
+                (note: target, folderURL: targetFolder)
+            ],
+            outputRoot: root,
+            format: .markdown,
+            addDatePrefix: false,
+            dateFormat: "yyyy-MM-dd",
+            existingManifest: nil
+        )
+        let rewritten = rewriteInternalLinks(
+            html: "<a href=\"applenotes:note/22222222-2222-2222-2222-222222222222\">Target</a>",
+            currentNoteRelativePath: map[source.id]!,
+            noteIdToRelativePath: map
+        )
+
+        XCTAssertEqual(map[target.identifier], "Fixture/Work/Target.md")
+        XCTAssertTrue(rewritten.contains("href=\"../Work/Target.md\""), rewritten)
     }
 
     // MARK: - defaultNotesFolder / localized default folder
@@ -1466,11 +1658,18 @@ final class ExportSupportTests: XCTestCase {
 
         let unpacked = root.appendingPathComponent("unpacked")
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        // This test checks the archive's timestamp metadata, not ditto's ZIP
+        // timestamp conversion. On macOS, ditto can interpret the DOS local
+        // timestamp with the standard-time offset during daylight saving time,
+        // even though the archive's UT extra field contains the correct UTC
+        // instant. Info-ZIP honors that field and keeps this assertion about
+        // the archive rather than the extractor's timezone behavior.
         let unzip = Process()
-        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        unzip.arguments = ["-x", "-k", archive.path, unpacked.path]
+        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        unzip.arguments = ["-q", archive.path, "-d", unpacked.path]
         try unzip.run()
         unzip.waitUntilExit()
+        XCTAssertEqual(unzip.terminationStatus, 0, "archive could not be expanded")
 
         let restored = unpacked.appendingPathComponent("Apple Notes Export/iCloud/Notes/Old Note.md")
         let attrs = try FileManager.default.attributesOfItem(atPath: restored.path)
@@ -1673,5 +1872,722 @@ final class ExportSupportTests: XCTestCase {
             outputRoot: root
         )
         XCTAssertTrue(healed.isEmpty)
+    }
+}
+
+// MARK: - Agent B: PDF Layout & Typography Engine Tests
+
+import PDFKit
+import WebKit
+import HtmlToPdf
+
+final class SimpleNavDelegate: NSObject, WKNavigationDelegate, @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func waitForFinish() async throws {
+        try await withCheckedThrowingContinuation { cont in
+            self.continuation = cont
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+}
+
+extension ExportSupportTests {
+
+    func test_pdfStyleProfile_enumAndDisplayNames() {
+        XCTAssertEqual(PDFStyleProfile.allCases.count, 2)
+        XCTAssertTrue(PDFStyleProfile.allCases.contains(.faithful))
+        XCTAssertTrue(PDFStyleProfile.allCases.contains(.study))
+
+        XCTAssertEqual(PDFStyleProfile.faithful.displayName, "Faithful")
+        XCTAssertEqual(PDFStyleProfile.study.displayName, "Study")
+
+        XCTAssertFalse(PDFStyleProfile.faithful.description.isEmpty)
+        XCTAssertFalse(PDFStyleProfile.study.description.isEmpty)
+
+        // Typealias check
+        let aliasProfile: PDFLayoutProfile = .study
+        XCTAssertEqual(aliasProfile, PDFStyleProfile.study)
+    }
+
+    func test_pdfDocumentOptions_defaultsAndPresets() {
+        let studyDefault = PDFDocumentOptions.a4Study
+        XCTAssertEqual(studyDefault.profile, .study)
+        XCTAssertEqual(studyDefault.pageSize, CGSize(width: 595, height: 842))
+        XCTAssertEqual(studyDefault.pageMargins.top, 40)
+        XCTAssertEqual(studyDefault.pageMargins.left, 40)
+        XCTAssertEqual(studyDefault.pageMargins.bottom, 40)
+        XCTAssertEqual(studyDefault.pageMargins.right, 40)
+        XCTAssertEqual(studyDefault.baseFontSizePoints, 10.5)
+        XCTAssertEqual(studyDefault.centerImages, true)
+        XCTAssertEqual(studyDefault.maxImageWidthPercent, 85.0)
+
+        let faithfulDefault = PDFDocumentOptions.a4Faithful
+        XCTAssertEqual(faithfulDefault.profile, .faithful)
+        XCTAssertEqual(faithfulDefault.pageSize, CGSize(width: 595, height: 842))
+        XCTAssertEqual(faithfulDefault.pageMargins.top, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.left, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.bottom, 36)
+        XCTAssertEqual(faithfulDefault.pageMargins.right, 36)
+        XCTAssertEqual(faithfulDefault.baseFontSizePoints, 11.0)
+        XCTAssertEqual(faithfulDefault.centerImages, false)
+        XCTAssertEqual(faithfulDefault.maxImageWidthPercent, 100.0)
+
+        // Custom options initialization and equality
+        let custom = PDFDocumentOptions(
+            profile: .study,
+            pageSize: CGSize(width: 612, height: 792),
+            pageMargins: NSEdgeInsets(top: 50, left: 50, bottom: 50, right: 50),
+            fontFamily: "Georgia, serif",
+            baseFontSizePoints: 12.0,
+            accentColor: "#10b981",
+            centerImages: true,
+            maxImageWidthPercent: 75.0,
+            embedPageMarginsInCSS: true,
+            showHeader: true,
+            customCSS: "/* custom */"
+        )
+        XCTAssertEqual(custom.profile, .study)
+        XCTAssertEqual(custom.pageSize.width, 612)
+        XCTAssertEqual(custom.pageSize.height, 792)
+        XCTAssertEqual(custom.accentColor, "#10b981")
+        XCTAssertEqual(custom.fontFamily, "Georgia, serif")
+        XCTAssertEqual(custom.baseFontSizePoints, 12.0)
+        XCTAssertTrue(custom.embedPageMarginsInCSS)
+        XCTAssertTrue(custom.showHeader)
+        XCTAssertEqual(custom.customCSS, "/* custom */")
+    }
+
+    func test_pdfImageConstraint_faithfulAndStudy() {
+        let a4Size = CGSize(width: 595, height: 842)
+        let faithfulMargins = NSEdgeInsets(top: 36, left: 36, bottom: 36, right: 36)
+        let faithfulConstraint = pdfImageConstraint(profile: .faithful, pageSize: a4Size, margins: faithfulMargins)
+        // 842 - 36 - 36 - 20 = 750
+        XCTAssertTrue(faithfulConstraint.contains("max-height: 750.0pt") || faithfulConstraint.contains("max-height: 750pt"))
+        XCTAssertTrue(faithfulConstraint.contains("height: auto;"))
+
+        let studyMargins = NSEdgeInsets(top: 40, left: 40, bottom: 40, right: 40)
+        let studyConstraint = pdfImageConstraint(profile: .study, pageSize: a4Size, margins: studyMargins)
+        // 842 - 40 - 40 - 20 = 742 * 0.48 = ~356.16pt (capped <= 380)
+        XCTAssertTrue(studyConstraint.contains("max-height:"))
+        XCTAssertTrue(studyConstraint.contains("height: auto;"))
+    }
+
+    func test_pdfDocumentCSS_faithful_containsEssentialRules() {
+        let options = PDFDocumentOptions.a4Faithful
+        let css = pdfDocumentCSS(options: options)
+
+        // Apple Notes faithful styling characteristics
+        XCTAssertTrue(css.contains("Apple Notes Exporter — Faithful PDF Profile"))
+        XCTAssertTrue(css.contains("@page"))
+        XCTAssertTrue(css.contains("size: 595.0pt 842.0pt") || css.contains("size: 595pt 842pt"))
+        XCTAssertTrue(css.contains("-webkit-print-color-adjust: exact !important;"))
+
+        // Headings break avoidance
+        XCTAssertTrue(css.contains("page-break-after: avoid !important;"))
+
+        // Monostyle
+        XCTAssertTrue(css.contains("pre, pre.ane-monostyle, .ane-monostyle"))
+        XCTAssertTrue(css.contains("background-color: #f4f4f6 !important;"))
+        XCTAssertTrue(css.contains("border: 1px solid #e5e5ea !important;"))
+        XCTAssertTrue(css.contains("white-space: pre-wrap !important;"))
+
+        // Highlights and colors
+        XCTAssertTrue(css.contains("mark, .ane-highlight"))
+        XCTAssertTrue(css.contains(".ane-highlight-yellow"))
+        XCTAssertTrue(css.contains(".ane-color-blue"))
+        XCTAssertTrue(css.contains(".ane-color-red"))
+
+        // Tables and paging
+        XCTAssertTrue(css.contains("display: table-header-group;"))
+        XCTAssertTrue(css.contains("page-break-inside: avoid !important;"))
+        XCTAssertTrue(css.contains(".page-break"))
+    }
+
+    func test_pdfDocumentCSS_study_containsProfessionalTypography() {
+        let options = PDFDocumentOptions.a4Study
+        let css = pdfDocumentCSS(options: options)
+
+        // Study profile characteristics
+        XCTAssertTrue(css.contains("Apple Notes Exporter — Study PDF Profile"))
+        XCTAssertTrue(css.contains("line-height: 1.58;"))
+        XCTAssertTrue(css.contains("orphans: 3;"))
+        XCTAssertTrue(css.contains("widows: 3;"))
+
+        // Headings hierarchy & accents
+        XCTAssertTrue(css.contains("border-bottom: 1px solid #f1f5f9;"))
+
+        // Monostyle technical callout with accent bar
+        XCTAssertTrue(css.contains("border-left: 3.5px solid #2563eb !important;"))
+        XCTAssertTrue(css.contains("background-color: #f8fafc !important;"))
+
+        // Proportional centered images
+        XCTAssertTrue(css.contains("margin: 18px auto !important;"))
+        XCTAssertTrue(css.contains("max-width: 85.0% !important;") || css.contains("max-width: 85% !important;"))
+        XCTAssertTrue(css.contains("object-fit: contain;"))
+        XCTAssertTrue(css.contains("box-shadow:"))
+
+        // Zebra striped tables
+        XCTAssertTrue(css.contains("table tr:nth-child(even):not(:first-child) td"))
+        XCTAssertTrue(css.contains("background-color: #f8fafc;"))
+        XCTAssertTrue(css.contains("display: table-header-group;"))
+        XCTAssertTrue(css.contains("border: 1px solid #cbd5e1 !important;"))
+
+        // Paging utilities
+        XCTAssertTrue(css.contains(".page-break"))
+        XCTAssertTrue(css.contains(".no-break"))
+    }
+
+    func test_extractHTMLBodyContent_behavior() {
+        // Full html document with body
+        let fullHtml = "<!DOCTYPE html><html><head><title>Doc</title></head><body class=\"test-class\"><p>Hello World</p></body></html>"
+        XCTAssertEqual(extractHTMLBodyContent(fullHtml), "<p>Hello World</p>")
+
+        // Body without attributes
+        let simpleBody = "<body><div>Content here</div></body>"
+        XCTAssertEqual(extractHTMLBodyContent(simpleBody), "<div>Content here</div>")
+
+        // Fragment without body tags should return unmodified
+        let fragment = "<p>Fragment text</p>"
+        XCTAssertEqual(extractHTMLBodyContent(fragment), "<p>Fragment text</p>")
+    }
+
+    func test_notePDFHTMLDocument_faithfulAndStudy_generation() {
+        let body = "<h2>Section Title</h2><p>This is study content with <mark class=\"ane-highlight\">highlights</mark> and <pre class=\"ane-monostyle\">code</pre>.</p>"
+        let title = "Meeting & Notes <Test>"
+        let created = "2026-10-23 10:00:00"
+        let modified = "2026-10-23 11:30:00"
+
+        // Faithful document without header
+        let faithfulDoc = notePDFHTMLDocument(
+            title: title,
+            created: created,
+            modified: modified,
+            options: .a4Faithful,
+            body: body
+        )
+        XCTAssertTrue(faithfulDoc.contains("<!DOCTYPE html>"))
+        XCTAssertTrue(faithfulDoc.contains("<title>Meeting &amp; Notes &lt;Test&gt;</title>"))
+        XCTAssertTrue(faithfulDoc.contains("meta name=\"ane-profile\" content=\"faithful\""))
+        XCTAssertTrue(faithfulDoc.contains("class=\"ane-pdf-document ane-profile-faithful\""))
+        XCTAssertTrue(faithfulDoc.contains("Apple Notes Exporter — Faithful PDF Profile"))
+        XCTAssertTrue(faithfulDoc.contains(body))
+        XCTAssertFalse(faithfulDoc.contains("class=\"ane-document-header\"")) // showHeader is false by default
+
+        // Study document with header enabled
+        var studyOptions = PDFDocumentOptions.a4Study
+        studyOptions.showHeader = true
+        let studyDoc = notePDFHTMLDocument(
+            title: title,
+            created: created,
+            modified: modified,
+            options: studyOptions,
+            body: body
+        )
+        XCTAssertTrue(studyDoc.contains("meta name=\"ane-profile\" content=\"study\""))
+        XCTAssertTrue(studyDoc.contains("class=\"ane-pdf-document ane-profile-study\""))
+        XCTAssertTrue(studyDoc.contains("Apple Notes Exporter — Study PDF Profile"))
+        XCTAssertTrue(studyDoc.contains("<header class=\"ane-document-header\""))
+        XCTAssertTrue(studyDoc.contains("Meeting &amp; Notes &lt;Test&gt;"))
+        XCTAssertTrue(studyDoc.contains("Created: 2026-10-23 10:00:00"))
+        XCTAssertTrue(studyDoc.contains("Modified: 2026-10-23 11:30:00"))
+        XCTAssertTrue(studyDoc.contains(body))
+    }
+
+    func test_backwardCompatibility_existingNoteHTMLDocumentRemainsUnchanged() {
+        // Ensure legacy noteHTMLDocument() is preserved bit-for-bit in behavior
+        let legacyHTML = noteHTMLDocument(
+            title: "Legacy Note",
+            created: "2026-01-01",
+            modified: "2026-01-02",
+            fontFamily: "-apple-system",
+            fontSize: "13px",
+            margin: "0px",
+            imageConstraint: "max-height: 100%;",
+            body: "<p>Original Body</p>"
+        )
+        XCTAssertTrue(legacyHTML.contains("line-height: 1.0;"))
+        XCTAssertTrue(legacyHTML.contains("max-width: 800px;"))
+        XCTAssertTrue(legacyHTML.contains("h1, h2, h3, h4, h5, h6, p { margin: 0; padding: 0; line-height: 1.0; }"))
+        XCTAssertTrue(legacyHTML.contains("<p>Original Body</p>"))
+    }
+
+    @MainActor
+    func test_webKit_renderSyntheticPDF_faithful() async throws {
+        let syntheticTitle = "Faithful Architecture Note"
+        let syntheticBody = """
+        <h1>Faithful Architecture Note</h1>
+        <p>Validating Apple Notes faithful layout with monostyle, colors, and tables.</p>
+        <pre class="ane-monostyle">func processAttachment() -&gt; Bool { return true }</pre>
+        <p>Highlight: <mark class="ane-highlight ane-highlight-yellow">important yellow</mark></p>
+        <p>Status: <span class="ane-color-green">Success</span> and <span class="ane-color-red">Error</span></p>
+        <table class="ane-table"><tr><th>Column A</th><th>Column B</th></tr><tr><td>Cell 1</td><td>Cell 2</td></tr></table>
+        """
+
+        let html = notePDFHTMLDocument(
+            title: syntheticTitle,
+            created: "2026-10-23",
+            options: .a4Faithful,
+            body: syntheticBody
+        )
+
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 595, height: 842))
+        let navDelegate = SimpleNavDelegate()
+        webView.navigationDelegate = navDelegate
+        webView.loadHTMLString(html, baseURL: nil)
+        try await navDelegate.waitForFinish()
+
+        let pdfConfig = WKPDFConfiguration()
+        pdfConfig.rect = CGRect(x: 0, y: 0, width: 595, height: 842)
+
+        let pdfData = try await webView.pdf(configuration: pdfConfig)
+        XCTAssertGreaterThan(pdfData.count, 0)
+
+        guard let doc = PDFDocument(data: pdfData) else {
+            XCTFail("Failed to parse rendered Faithful PDF")
+            return
+        }
+        XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+        try attachRenderedPagePreviews(doc, profile: "Faithful")
+
+        var fullText = ""
+        for i in 0..<doc.pageCount {
+            if let p = doc.page(at: i), let str = p.string {
+                fullText += str + " "
+            }
+        }
+        XCTAssertTrue(fullText.contains("Faithful Architecture Note"))
+        XCTAssertTrue(fullText.contains("processAttachment"))
+        XCTAssertTrue(fullText.contains("important yellow"))
+        XCTAssertTrue(fullText.contains("Column A"))
+        XCTAssertTrue(fullText.contains("Cell 1"))
+    }
+
+    @MainActor
+    func test_webKit_renderSyntheticPDF_study() async throws {
+        let syntheticTitle = "Study Guide Architecture Note"
+        let syntheticBody = """
+        <h1>Study Guide Architecture Note</h1>
+        <p>Validating study layout with typography, monostyle callout, and page breaks.</p>
+        <pre class="ane-monostyle">struct StudySummary: Sendable { let topic: String }</pre>
+        <p>Highlight: <mark class="ane-highlight ane-highlight-green">key concept</mark></p>
+        <table class="ane-table"><thead><tr><th>Header 1</th><th>Header 2</th></tr></thead><tbody><tr><td>Data 1</td><td>Data 2</td></tr></tbody></table>
+        <div class="page-break"></div>
+        <h2>Page 2 Section</h2>
+        <p>This text is separated by page-break utility.</p>
+        """
+
+        var studyOptions = PDFDocumentOptions.a4Study
+        studyOptions.showHeader = true
+        let html = notePDFHTMLDocument(
+            title: syntheticTitle,
+            created: "2026-10-23 09:30",
+            options: studyOptions,
+            body: syntheticBody
+        )
+
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 595, height: 842))
+        let navDelegate = SimpleNavDelegate()
+        webView.navigationDelegate = navDelegate
+        webView.loadHTMLString(html, baseURL: nil)
+        try await navDelegate.waitForFinish()
+
+        let pdfConfig = WKPDFConfiguration()
+        pdfConfig.rect = CGRect(x: 0, y: 0, width: 595, height: 842)
+
+        let pdfData = try await webView.pdf(configuration: pdfConfig)
+        XCTAssertGreaterThan(pdfData.count, 0)
+
+        guard let doc = PDFDocument(data: pdfData) else {
+            XCTFail("Failed to parse rendered Study PDF")
+            return
+        }
+        XCTAssertGreaterThanOrEqual(doc.pageCount, 1)
+        try attachRenderedPagePreviews(doc, profile: "Study")
+
+        var fullText = ""
+        for i in 0..<doc.pageCount {
+            if let p = doc.page(at: i), let str = p.string {
+                fullText += str + " "
+            }
+        }
+        XCTAssertTrue(fullText.contains("Study Guide Architecture Note"))
+        XCTAssertTrue(fullText.contains("Created: 2026-10-23 09:30"))
+        XCTAssertTrue(fullText.contains("StudySummary"))
+        XCTAssertTrue(fullText.contains("key concept"))
+        XCTAssertTrue(fullText.contains("Header 1"))
+        XCTAssertTrue(fullText.contains("Page 2 Section"))
+    }
+}
+
+final class PDFHTMLSecurityTests: XCTestCase {
+    func testPDFHTMLEscapesUntrustedMetadataAndDeclaresStrictPolicy() {
+        var options = PDFDocumentOptions.a4Study
+        options.showHeader = true
+        let html = notePDFHTMLDocument(
+            title: "\"><script>alert(1)</script>",
+            created: "\"><script>created()</script>&",
+            modified: "\" onload=\"alert(2)",
+            options: options,
+            body: "<img src=\"https://example.invalid/pixel\" onerror=\"alert(3)\"><script>alert(4)</script>"
+        )
+
+        XCTAssertTrue(html.contains("content=\"&quot;&gt;&lt;script&gt;created()&lt;/script&gt;&amp;\""))
+        XCTAssertTrue(html.contains("content=\"&quot; onload=&quot;alert(2)\""))
+        XCTAssertTrue(html.contains("script-src 'none'"))
+        XCTAssertTrue(html.contains("img-src data:"))
+        XCTAssertTrue(html.contains("connect-src 'none'"))
+        XCTAssertTrue(html.contains("frame-src 'none'"))
+    }
+
+    @MainActor
+    func testPDFWebViewConfigurationDisablesScriptsAndBlocksExternalLoads() async throws {
+        let configuration = try await PDFWebViewIsolation.makeConfiguration()
+
+        XCTAssertFalse(configuration.defaultWebpagePreferences.allowsContentJavaScript)
+        XCTAssertFalse(configuration.preferences.javaScriptCanOpenWindowsAutomatically)
+        XCTAssertFalse(configuration.websiteDataStore.isPersistent)
+        XCTAssertTrue(PDFWebViewIsolation.externalResourceBlockingRuleJSON.contains("^https?://"))
+        XCTAssertTrue(PDFWebViewIsolation.externalResourceBlockingRuleJSON.contains("\"type\":\"block\""))
+    }
+}
+
+private final class PendingPDFPrintCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: ((Bool) -> Void)?
+
+    func store(_ completion: @escaping (Bool) -> Void) {
+        lock.lock()
+        self.completion = completion
+        lock.unlock()
+    }
+
+    func finish(_ success: Bool) {
+        lock.lock()
+        let completion = self.completion
+        self.completion = nil
+        lock.unlock()
+        completion?(success)
+    }
+}
+
+final class PDFPrintCancellationTests: XCTestCase {
+    func testCancellationWhilePrintIsPendingWaitsForCompletionCallback() async throws {
+        let delegate = PDFPrintOperationDelegate()
+        let pending = PendingPDFPrintCompletion()
+        let started = expectation(description: "print operation started")
+        let returned = expectation(description: "cancelled print waiter returned too early")
+        returned.isInverted = true
+
+        let task = Task {
+            try await delegate.run { completion in
+                pending.store(completion)
+                started.fulfill()
+            }
+            try Task.checkCancellation()
+            returned.fulfill()
+        }
+
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        await fulfillment(of: [returned], timeout: 0.1)
+
+        pending.finish(true)
+        do {
+            try await task.value
+            XCTFail("Expected cancellation after the pending print callback")
+        } catch is CancellationError {
+            // Expected: the AppKit-style completion gate returns only after
+            // the pending print is released, then the caller observes cancel.
+        }
+    }
+}
+
+
+// MARK: - Embedded PDF attachment regressions
+
+final class PDFEmbeddedFileWriterTests: XCTestCase {
+    private func makePDF(pageCount: Int, pageSize: CGSize = CGSize(width: 300, height: 400)) throws -> Data {
+        let data = NSMutableData()
+        var mediaBox = CGRect(origin: .zero, size: pageSize)
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw SyntheticPDFTestError.invalidDocument
+        }
+        let colors: [CGColor] = [
+            CGColor(red: 0.92, green: 0.18, blue: 0.16, alpha: 1),
+            CGColor(red: 0.15, green: 0.72, blue: 0.34, alpha: 1),
+            CGColor(red: 0.12, green: 0.36, blue: 0.88, alpha: 1)
+        ]
+        for index in 0..<pageCount {
+            context.beginPDFPage([kCGPDFContextMediaBox: mediaBox] as CFDictionary)
+            context.setFillColor(colors[index % colors.count])
+            context.fill(mediaBox)
+            context.endPDFPage()
+        }
+        context.closePDF()
+        return data as Data
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ane-embedded-pdf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    private func qpdfURL() throws -> URL {
+        let candidates = ["/opt/homebrew/bin/qpdf", "/usr/local/bin/qpdf", "/usr/bin/qpdf"]
+        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("qpdf is unavailable; embedded-file interoperability verification requires qpdf.")
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func pdfdetachURL() throws -> URL {
+        let candidates = ["/opt/homebrew/bin/pdfdetach", "/usr/local/bin/pdfdetach", "/usr/bin/pdfdetach"]
+        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("Poppler pdfdetach is unavailable; the independent embedded-file reader check was skipped.")
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func runPDFDetach(_ arguments: [String], executable: URL) throws -> Data {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let output = Pipe()
+        let errorOutput = Pipe()
+        process.standardOutput = output
+        process.standardError = errorOutput
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let diagnostics = errorOutput.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            "pdfdetach \(arguments.joined(separator: " ")) failed: \(String(decoding: diagnostics, as: UTF8.self))"
+        )
+        return data
+    }
+
+    private func runQPDF(_ arguments: [String], executable: URL) throws -> Data {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let output = Pipe()
+        let errorOutput = Pipe()
+        process.standardOutput = output
+        process.standardError = errorOutput
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let diagnostics = errorOutput.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            "qpdf \(arguments.joined(separator: " ")) failed: \(String(decoding: diagnostics, as: UTF8.self))"
+        )
+        return data
+    }
+
+    func testEmbeddedFilesRoundTripByteForByteWithoutAddingPages() throws {
+        let directory = try temporaryDirectory()
+        let input = directory.appendingPathComponent("note.pdf")
+        let output = directory.appendingPathComponent("note-with-attachments.pdf")
+        let notePDF = try makePDF(pageCount: 2)
+        let originalAttachment = try makePDF(pageCount: 3, pageSize: CGSize(width: 500, height: 240))
+        try notePDF.write(to: input, options: .atomic)
+
+        let duplicateOccurrence = PDFHTMLAttachmentInsertion(
+            attachmentID: "synthetic-pdf-1", filename: "quarterly-report.pdf", data: originalAttachment
+        )
+        let result = try PDFEmbeddedFileWriter.addAttachments(
+            [duplicateOccurrence, duplicateOccurrence], to: input, writingTo: output
+        )
+
+        XCTAssertEqual(result.pageCount, 2)
+        XCTAssertEqual(result.embeddedFileCount, 1, "Repeated note references to the same attachment must not duplicate its payload")
+        XCTAssertEqual(PDFDocument(url: input)?.pageCount, 2)
+        XCTAssertEqual(PDFDocument(url: output)?.pageCount, 2, "Only the note pages belong to the note PDF page tree")
+
+        let qpdf = try qpdfURL()
+        _ = try runQPDF(["--check", output.path], executable: qpdf)
+        let sourceTrailer = String(decoding: try runQPDF(["--show-object=trailer", input.path], executable: qpdf), as: UTF8.self)
+        let outputTrailer = String(decoding: try runQPDF(["--show-object=trailer", output.path], executable: qpdf), as: UTF8.self)
+        if sourceTrailer.contains("/Info") { XCTAssertTrue(outputTrailer.contains("/Info"), outputTrailer) }
+        if sourceTrailer.contains("/ID") { XCTAssertTrue(outputTrailer.contains("/ID"), outputTrailer) }
+        let listing = String(decoding: try runQPDF(["--list-attachments", output.path], executable: qpdf), as: UTF8.self)
+        XCTAssertTrue(listing.contains("quarterly-report.pdf"), listing)
+        let recovered = try runQPDF(["--show-attachment=quarterly-report.pdf", output.path], executable: qpdf)
+        XCTAssertEqual(recovered, originalAttachment, "Extracted attachment bytes must exactly match the source PDF")
+    }
+
+    func testPopplerListsAndExtractsEmbeddedPDFWithoutAddingPages() throws {
+        let directory = try temporaryDirectory()
+        let input = directory.appendingPathComponent("note.pdf")
+        let output = directory.appendingPathComponent("note-with-attachment.pdf")
+        let recovered = directory.appendingPathComponent("recovered.pdf")
+        let notePDF = try makePDF(pageCount: 2)
+        let originalAttachment = try makePDF(pageCount: 3, pageSize: CGSize(width: 500, height: 240))
+        try notePDF.write(to: input, options: .atomic)
+
+        _ = try PDFEmbeddedFileWriter.addAttachments([
+            PDFHTMLAttachmentInsertion(attachmentID: "poppler-reader-check", filename: "reader-check.pdf", data: originalAttachment)
+        ], to: input, writingTo: output)
+
+        let pdfdetach = try pdfdetachURL()
+        let listing = String(decoding: try runPDFDetach(["-list", output.path], executable: pdfdetach), as: UTF8.self)
+        XCTAssertTrue(listing.contains("reader-check.pdf"), listing)
+        _ = try runPDFDetach(["-save", "1", "-o", recovered.path, output.path], executable: pdfdetach)
+        XCTAssertEqual(try Data(contentsOf: recovered), originalAttachment)
+        XCTAssertEqual(PDFDocument(url: output)?.pageCount, 2, "The embedded three-page PDF must not add pages to the note")
+        XCTAssertEqual(PDFDocument(url: recovered)?.pageCount, 3)
+    }
+
+    func testDifferentAttachmentsWithSameFilenameRemainDistinctAndExtractable() throws {
+        let directory = try temporaryDirectory()
+        let input = directory.appendingPathComponent("note.pdf")
+        let output = directory.appendingPathComponent("note-with-attachments.pdf")
+        let basePDF = try makePDF(pageCount: 1)
+        let first = try makePDF(pageCount: 1)
+        let second = try makePDF(pageCount: 2)
+        try basePDF.write(to: input, options: .atomic)
+
+        _ = try PDFEmbeddedFileWriter.addAttachments([
+            PDFHTMLAttachmentInsertion(attachmentID: "first", filename: "report.pdf", data: first),
+            PDFHTMLAttachmentInsertion(attachmentID: "second", filename: "report.pdf", data: second)
+        ], to: input, writingTo: output)
+
+        let qpdf = try qpdfURL()
+        let listing = String(decoding: try runQPDF(["--list-attachments", output.path], executable: qpdf), as: UTF8.self)
+        XCTAssertTrue(listing.contains("report.pdf"), listing)
+        XCTAssertTrue(listing.contains("report (2).pdf"), listing)
+        XCTAssertEqual(try runQPDF(["--show-attachment=report.pdf", output.path], executable: qpdf), first)
+        XCTAssertEqual(try runQPDF(["--show-attachment=report (2).pdf", output.path], executable: qpdf), second)
+    }
+
+    func testConflictingBytesForRepeatedAttachmentIDFailClosed() throws {
+        let directory = try temporaryDirectory()
+        let input = directory.appendingPathComponent("note.pdf")
+        let output = directory.appendingPathComponent("should-not-exist.pdf")
+        try makePDF(pageCount: 1).write(to: input, options: .atomic)
+
+        XCTAssertThrowsError(try PDFEmbeddedFileWriter.addAttachments([
+            PDFHTMLAttachmentInsertion(attachmentID: "same-id", filename: "one.pdf", data: try makePDF(pageCount: 1)),
+            PDFHTMLAttachmentInsertion(attachmentID: "same-id", filename: "one.pdf", data: try makePDF(pageCount: 2))
+        ], to: input, writingTo: output)) { error in
+            guard case PDFEmbeddedFileWriterError.conflictingDuplicateAttachment = error else {
+                return XCTFail("Expected duplicate-ID conflict, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testCancellationDuringIncrementalWriteLeavesNoPartialOutput() throws {
+        let directory = try temporaryDirectory()
+        let input = directory.appendingPathComponent("note.pdf")
+        let output = directory.appendingPathComponent("cancelled.pdf")
+        try makePDF(pageCount: 1).write(to: input, options: .atomic)
+        let attachment = PDFHTMLAttachmentInsertion(
+            attachmentID: "cancelled", filename: "cancelled.pdf", data: try makePDF(pageCount: 1)
+        )
+        var checks = 0
+
+        XCTAssertThrowsError(try PDFEmbeddedFileWriter.addAttachments(
+            [attachment], to: input, writingTo: output
+        ) {
+            checks += 1
+            if checks == 3 { throw CancellationError() }
+        }) { error in
+            XCTAssertTrue(error is CancellationError, "Cancellation must not be converted into a generic write failure")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        XCTAssertFalse(leftovers.contains { $0.hasSuffix(".partial") })
+    }
+
+    func testAttachmentCardsRespectModeAndKeepSourceOrder() throws {
+        let firstData = try makePDF(pageCount: 1)
+        let secondData = try makePDF(pageCount: 2)
+        let attachments = [
+            NotesAttachment(id: "first", typeUTI: "com.adobe.pdf", filename: "first.pdf"),
+            NotesAttachment(id: "second", typeUTI: "public.pdf", filename: "second.pdf")
+        ]
+        let html = """
+        <span data-attachment-id="first" data-attachment-type="com.adobe.pdf">first</span>
+        <span data-attachment-id="second" data-attachment-type="public.pdf">second</span>
+        """
+        let data = ["first": firstData, "second": secondData]
+
+        let preview = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: html,
+            attachments: attachments,
+            reason: "synthetic fallback",
+            verifiedPDFDataByID: data,
+            pdfAttachmentMode: .previewAndEmbed
+        )
+        XCTAssertEqual(preview.embeddedPDFInsertions.map(\.attachmentID), ["first", "second"])
+        XCTAssertTrue(preview.html.contains("ane-pdf-attachment-preview"))
+        XCTAssertTrue(preview.html.contains("first.pdf"))
+        XCTAssertTrue(preview.html.contains("second.pdf"))
+
+        let embedOnly = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: html,
+            attachments: attachments,
+            reason: "synthetic fallback",
+            verifiedPDFDataByID: data,
+            pdfAttachmentMode: .embedOnly
+        )
+        XCTAssertEqual(embedOnly.embeddedPDFInsertions.map(\.attachmentID), ["first", "second"])
+        XCTAssertFalse(embedOnly.html.contains("<img"), "Embed-only mode must not create a preview image")
+        XCTAssertTrue(embedOnly.html.contains("ane-pdf-attachment-icon"))
+        XCTAssertTrue(embedOnly.html.contains("first.pdf"))
+        XCTAssertFalse(embedOnly.html.contains("ane-pdf-attachment-status"), "A successful embed-only reference contains only its icon and filename")
+    }
+
+    func testMissingAndCorruptPDFsRemainClearlyMarkedAndCounted() throws {
+        let attachment = NotesAttachment(id: "damaged", typeUTI: "public.pdf", filename: "damaged.pdf")
+        let marker = #"<span data-attachment-id="damaged" data-attachment-type="public.pdf">file</span>"#
+
+        let missing = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: marker,
+            attachments: [attachment],
+            reason: "synthetic missing attachment"
+        )
+        XCTAssertTrue(missing.embeddedPDFInsertions.isEmpty)
+        XCTAssertEqual(missing.incompleteAttachmentIDs, ["damaged"])
+        XCTAssertTrue(missing.html.contains("damaged.pdf"))
+        XCTAssertTrue(missing.html.localizedCaseInsensitiveContains("not embedded"))
+
+        let damagedBytes = Data("not-a-valid-pdf".utf8)
+        let corrupt = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: marker,
+            attachments: [attachment],
+            reason: "synthetic corrupt bytes",
+            verifiedPDFDataByID: ["damaged": damagedBytes],
+            invalidPDFIDs: ["damaged"],
+            pdfAttachmentMode: .previewAndEmbed
+        )
+        XCTAssertEqual(corrupt.incompleteAttachmentIDs, ["damaged"])
+        XCTAssertEqual(corrupt.embeddedPDFInsertions.map(\.data), [damagedBytes])
+        XCTAssertFalse(corrupt.html.contains("<img"), "Damaged source bytes must not produce a misleading preview")
+        XCTAssertTrue(corrupt.html.localizedCaseInsensitiveContains("damaged"))
     }
 }

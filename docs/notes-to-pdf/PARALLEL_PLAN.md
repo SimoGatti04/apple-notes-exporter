@@ -1,6 +1,6 @@
 # Parallel development plan — manual Codex delegation
 
-Status: PREPARED. No agents launched. Codex Supervisor unavailable by user decision; prompts are delivered to user for forwarding.
+Status: **P2 integration complete — READY WITH LIMITATIONS** on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). The four implementation commits are preserved as ancestors of the integration branch. P3 items (portable generic-file/gallery attachments, merged multi-note PDF, and real Notes/UI acceptance) remain deferred or unverified. This file retains the original plan and prompts as historical execution guidance.
 
 ## Phase P0 — gate before workers (one agent)
 1. Inspect actual local repo `~/Workspace/apple-notes-exporter` and relevant rules under sibling `development-environment` (`AGENTS.md`, engineering, version control, orchestration, tooling). Validate local repo path, branch, detached/uncommitted/unpushed state, remote origin and relevant worktrees. Do not destroy or overwrite unrecognized changes.

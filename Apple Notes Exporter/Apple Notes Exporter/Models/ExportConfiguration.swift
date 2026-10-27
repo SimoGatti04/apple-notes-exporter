@@ -181,9 +181,68 @@ struct HTMLConfiguration: ExportConfigurable {
 
 // MARK: - PDF Configuration
 
+enum PDFAttachmentMode: String, Codable, CaseIterable, Identifiable {
+    case previewAndEmbed
+    case embedOnly
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .previewAndEmbed: return "Preview + embed"
+        case .embedOnly: return "Embed only"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .previewAndEmbed:
+            return "Show a compact first-page preview and embed the original PDF. Opening or extracting it requires a PDF reader that supports embedded attachments."
+        case .embedOnly:
+            return "Show only a compact file reference and embed the original PDF without generating a preview. Opening or extracting it requires a PDF reader that supports embedded attachments."
+        }
+    }
+}
+
 struct PDFConfiguration: ExportConfigurable {
     var htmlConfiguration: HTMLConfiguration
     var pageSize: PageSize
+    var styleProfile: PDFStyleProfile
+    var attachmentMode: PDFAttachmentMode
+
+    private enum CodingKeys: String, CodingKey {
+        case htmlConfiguration, pageSize, styleProfile, attachmentMode
+    }
+
+    init(
+        htmlConfiguration: HTMLConfiguration,
+        pageSize: PageSize,
+        styleProfile: PDFStyleProfile = .study,
+        attachmentMode: PDFAttachmentMode = .previewAndEmbed
+    ) {
+        self.htmlConfiguration = htmlConfiguration
+        self.pageSize = pageSize
+        self.styleProfile = styleProfile
+        self.attachmentMode = attachmentMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        htmlConfiguration = try container.decode(HTMLConfiguration.self, forKey: .htmlConfiguration)
+        pageSize = try container.decode(PageSize.self, forKey: .pageSize)
+        // Configurations saved before PDF profiles were introduced remain valid.
+        styleProfile = try container.decodeIfPresent(PDFStyleProfile.self, forKey: .styleProfile) ?? .study
+        // Existing configurations retain the requested compact-preview default.
+        attachmentMode = try container.decodeIfPresent(PDFAttachmentMode.self, forKey: .attachmentMode) ?? .previewAndEmbed
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(htmlConfiguration, forKey: .htmlConfiguration)
+        try container.encode(pageSize, forKey: .pageSize)
+        try container.encode(styleProfile, forKey: .styleProfile)
+        try container.encode(attachmentMode, forKey: .attachmentMode)
+    }
 
     enum PageSize: String, Codable, CaseIterable {
         case letter = "Letter"
@@ -220,7 +279,8 @@ struct PDFConfiguration: ExportConfigurable {
 
         return PDFConfiguration(
             htmlConfiguration: .defaultConfiguration,
-            pageSize: defaultPageSize
+            pageSize: defaultPageSize,
+            styleProfile: .study
         )
     }
 }
@@ -331,6 +391,11 @@ enum FilenameDateFormat: String, Codable, CaseIterable {
 ///
 /// The two axes are independent. A single joined file inside a .zip is a
 /// supported combination, so they cannot be collapsed into one enum.
+enum ExportFolderOrganization: String, Codable, CaseIterable {
+    case allTogether
+    case asInNotes
+}
+
 struct ExportDestination: Codable, Equatable {
     enum Layout: String, Codable, CaseIterable {
         case tree
@@ -372,6 +437,9 @@ struct ExportConfigurations: Codable {
     /// When true, write every attachment under <output>/Attachments/ instead of
     /// a per-note " (Attachments)" folder beside the note file.
     var sharedAttachmentsFolder: Bool = false
+    /// Placement of per-note exports when the output contains a folder tree.
+    /// Concatenated files and incremental sync keep their existing behavior.
+    var folderOrganization: ExportFolderOrganization = .allTogether
     var incrementalSync: Bool = false
 
     /// How the export is delivered.
@@ -443,7 +511,7 @@ struct ExportConfigurations: Codable {
     enum CodingKeys: String, CodingKey {
         case html, pdf, latex, rtf
         case addDateToFilename, filenameDateFormat, includeAttachments
-        case sharedAttachmentsFolder, incrementalSync
+        case sharedAttachmentsFolder, folderOrganization, incrementalSync
         case destination
         // Read-only now: settings saved before the destination became one
         // value still decode. Nothing writes them any more.
@@ -453,6 +521,7 @@ struct ExportConfigurations: Codable {
     init(html: HTMLConfiguration, pdf: PDFConfiguration, latex: LaTeXConfiguration, rtf: RTFConfiguration,
          addDateToFilename: Bool = false, filenameDateFormat: FilenameDateFormat = .iso,
          includeAttachments: Bool = true, sharedAttachmentsFolder: Bool = false,
+         folderOrganization: ExportFolderOrganization = .allTogether,
          concatenateOutput: Bool = false, incrementalSync: Bool = false,
          zipOutput: Bool = false, tarOutput: Bool = false) {
         self.html = html
@@ -463,6 +532,7 @@ struct ExportConfigurations: Codable {
         self.filenameDateFormat = filenameDateFormat
         self.includeAttachments = includeAttachments
         self.sharedAttachmentsFolder = sharedAttachmentsFolder
+        self.folderOrganization = folderOrganization
         self.concatenateOutput = concatenateOutput
         self.incrementalSync = incrementalSync
         self.zipOutput = zipOutput
@@ -479,6 +549,7 @@ struct ExportConfigurations: Codable {
         filenameDateFormat = try c.decodeIfPresent(FilenameDateFormat.self, forKey: .filenameDateFormat) ?? .iso
         includeAttachments = try c.decodeIfPresent(Bool.self, forKey: .includeAttachments) ?? true
         sharedAttachmentsFolder = try c.decodeIfPresent(Bool.self, forKey: .sharedAttachmentsFolder) ?? false
+        folderOrganization = try c.decodeIfPresent(ExportFolderOrganization.self, forKey: .folderOrganization) ?? .allTogether
         incrementalSync = try c.decodeIfPresent(Bool.self, forKey: .incrementalSync) ?? false
 
         // Prefer the current key; fall back to the three legacy booleans so a
@@ -507,6 +578,7 @@ struct ExportConfigurations: Codable {
         try c.encode(filenameDateFormat, forKey: .filenameDateFormat)
         try c.encode(includeAttachments, forKey: .includeAttachments)
         try c.encode(sharedAttachmentsFolder, forKey: .sharedAttachmentsFolder)
+        try c.encode(folderOrganization, forKey: .folderOrganization)
         try c.encode(incrementalSync, forKey: .incrementalSync)
         // One key, one source of truth. The legacy booleans are still decoded
         // above but are no longer written, so they cannot come back and

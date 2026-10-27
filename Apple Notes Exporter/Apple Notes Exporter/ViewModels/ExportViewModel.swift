@@ -19,19 +19,36 @@
 //
 
 import Foundation
+import AppKit
 import SwiftUI
 import OSLog
-import HtmlToPdf
+import PDFKit
+import WebKit
 
 // MARK: - Export Errors
 
 enum ExportError: Error, LocalizedError {
     case pdfGenerationTimeout
+    case invalidPDFDestinationDirectory(String)
+    case tooManyPDFNameCollisions
+    case pdfNavigationFailed(String)
+    case invalidGeneratedPDF
+    case pdfPrintFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .pdfGenerationTimeout:
-            return "PDF generation timed out after 60 seconds. This note may contain many large images or corrupted attachments."
+            return "PDF generation exceeded its time limit. This note may contain many large images or corrupted attachments."
+        case .invalidPDFDestinationDirectory(let name):
+            return "The selected PDF destination is not an existing folder: \(name)"
+        case .tooManyPDFNameCollisions:
+            return "Could not choose an unused filename for the PDF after 10,000 attempts."
+        case .pdfNavigationFailed(let message):
+            return "Could not load note content for PDF rendering: \(message)"
+        case .invalidGeneratedPDF:
+            return "The PDF renderer produced an invalid or empty document."
+        case .pdfPrintFailed(let message):
+            return "AppKit could not finish PDF printing: \(message)"
         }
     }
 }
@@ -72,6 +89,197 @@ enum ExportState: Equatable {
     }
 }
 
+// MARK: - Main-actor WebKit navigation completion
+
+@MainActor
+private final class PDFNavigationDelegate: NSObject, WKNavigationDelegate {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var initialDocumentNavigationAllowed = false
+
+    func load(_ html: String, in webView: WKWebView, baseURL: URL?) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            guard webView.loadHTMLString(html, baseURL: baseURL) != nil else {
+                finish(.failure(ExportError.pdfNavigationFailed("WebKit did not start HTML loading.")))
+                return
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        finish(.success(()))
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish(.failure(error))
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        let scheme = navigationAction.request.url?.scheme?.lowercased()
+        let isInitialLocalDocument = !initialDocumentNavigationAllowed
+            && navigationAction.targetFrame?.isMainFrame == true
+            && (scheme == "about" || scheme == "file")
+        if isInitialLocalDocument {
+            initialDocumentNavigationAllowed = true
+        }
+        decisionHandler(isInitialLocalDocument ? .allow : .cancel)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        finish(.failure(ExportError.pdfNavigationFailed("The WebKit content process terminated.")))
+    }
+
+    func cancel() {
+        finish(.failure(CancellationError()))
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(with: result)
+    }
+}
+
+/// A fresh, ephemeral WebKit configuration for untrusted note HTML. Active
+/// content is disabled, and the rule list blocks HTTP(S) loads even if a note
+/// contains resource tags outside the expected parser output.
+@MainActor
+enum PDFWebViewIsolation {
+    static let externalResourceBlockingRuleJSON = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}}]"#
+
+    static func makeConfiguration() async throws -> WKWebViewConfiguration {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        let ruleList = try await compileExternalResourceBlockingRule()
+        configuration.userContentController.add(ruleList)
+        return configuration
+    }
+
+    private static func compileExternalResourceBlockingRule() async throws -> WKContentRuleList {
+        try await withCheckedThrowingContinuation { continuation in
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "AppleNotesExporterPDFNoHTTP-v1",
+                encodedContentRuleList: externalResourceBlockingRuleJSON
+            ) { ruleList, error in
+                if let ruleList {
+                    continuation.resume(returning: ruleList)
+                } else if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(throwing: ExportError.pdfNavigationFailed(
+                        "WebKit did not create the PDF resource policy."
+                    ))
+                }
+            }
+        }
+    }
+}
+
+
+/// AppKit/WebKit PDF capture is not safe to overlap. The permit remains held
+/// until the print callback completes, including when its waiting task is
+/// cancelled, so preview refreshes cannot race an export's pending print.
+@MainActor
+private final class PDFRenderCoordinator {
+    static let shared = PDFRenderCoordinator()
+
+    private var isOccupied = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func withExclusiveAccess<T>(_ operation: @MainActor () async throws -> T) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if !isOccupied {
+            isOccupied = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            isOccupied = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+final class PDFPrintOperationDelegate: NSObject, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    @MainActor
+    func run(_ operation: NSPrintOperation, window: NSWindow) async throws {
+        try await run { _ in
+            operation.runModal(
+                for: window,
+                delegate: self,
+                didRun: #selector(printOperationDidRun(_:success:contextInfo:)),
+                contextInfo: nil
+            )
+        }
+    }
+
+    /// Shared completion gate. The injected starter is a deterministic test
+    /// seam for the interval between AppKit starting a print and invoking its
+    /// completion callback. Cancellation does not resume this continuation:
+    /// callers remain joined until AppKit confirms printing has stopped.
+    func run(_ startOperation: (@escaping (Bool) -> Void) -> Void) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+
+            startOperation { [weak self] success in
+                self?.finish(success: success)
+            }
+        }
+    }
+
+    @objc private func printOperationDidRun(
+        _ operation: NSPrintOperation,
+        success: Bool,
+        contextInfo: UnsafeMutableRawPointer?
+    ) {
+        // NSPrintOperation may call its delegate on the worker thread when
+        // canSpawnSeparateThread is enabled. Resume the continuation without
+        // touching actor-isolated or unsynchronized state from that callback.
+        finish(success: success)
+    }
+
+    private func finish(success: Bool) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+
+        guard let continuation else { return }
+        if success {
+            continuation.resume()
+        } else {
+            continuation.resume(throwing: ExportError.pdfPrintFailed("The print operation reported failure or cancellation."))
+        }
+    }
+}
+
 // MARK: - Export ViewModel
 
 @MainActor
@@ -91,6 +299,23 @@ class ExportViewModel: ObservableObject {
     /// Pre-allocated note-id -> relative file path map, set at the start of each export.
     /// Used by generateHTML to rewrite applenotes:note/UUID links to real paths.
     private var internalLinkMap: [String: String] = [:]
+
+    /// Attachments that could not be represented self-contained in the current
+    /// flat-PDF export. The IDs let multiple diagnostics for one attachment be
+    /// reported without inflating the final partial-failure count.
+    private var flatPDFIncompleteAttachmentIDs: Set<String> = []
+    private var flatPDFVerifiedDataByID: [String: Data] = [:]
+    private var flatPDFPreviewDataByID: [String: Data] = [:]
+    private var flatPDFInvalidPDFIDs: Set<String> = []
+    private var flatPDFInsertions: [PDFHTMLAttachmentInsertion] = []
+
+    /// WebViews currently owned by structured PDF rendering tasks. Cancellation
+    /// and timeout watchers stop navigation, while the task group still waits
+    /// for WebKit's PDF callback before releasing each instance.
+    private var activePDFWebViews: [UUID: WKWebView] = [:]
+    private var activePDFNavigationDelegates: [UUID: PDFNavigationDelegate] = [:]
+    private var timedOutPDFRenderIDs: Set<UUID> = []
+    private var suppressExportLogMessages = false
 
     // MARK: - Concurrency Settings
 
@@ -142,6 +367,40 @@ class ExportViewModel: ObservableObject {
     /// Export notes to the specified output directory
     /// Root name used for both the staging folder and the archive.
     static let zipRootName = exportArchiveRootName
+
+    /// A uniquely created, process-owned staging directory in the system temp
+    /// area. Only a URL returned by `createFlatPDFStagingDirectory` may be
+    /// passed to the matching cleanup helper.
+    private static let flatPDFStagingDirectoryPrefix = "apple-notes-exporter-pdf-"
+    private static let flatPDFDeliveryStagingDirectoryPrefix = ".apple-notes-exporter-pdf-delivery-"
+
+    private static func createFlatPDFStagingDirectory(
+        under temporaryRoot: URL = FileManager.default.temporaryDirectory,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        let directory = temporaryRoot.appendingPathComponent(
+            flatPDFStagingDirectoryPrefix + UUID().uuidString,
+            isDirectory: true
+        )
+        // Do not use `withIntermediateDirectories`: creation must fail closed
+        // if this supposedly unique path already belongs to somebody else.
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return directory
+    }
+
+    private static func removeFlatPDFStagingDirectory(
+        at directory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard directory.lastPathComponent.hasPrefix(flatPDFStagingDirectoryPrefix) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try fileManager.removeItem(at: directory)
+    }
 
     /// What the finished export actually produced: the archive for a zip
     /// export, otherwise the output folder. The archive name can differ from
@@ -287,13 +546,18 @@ class ExportViewModel: ObservableObject {
                 message: isSync ? "Starting incremental sync..." : "Starting export..."
             ))
 
-            // Group notes by account and folder for organized output
+            // A folder tree can either flatten all notes into the selected
+            // destination or preserve their Apple Notes account/folder paths.
+            // Sync and concatenated exports have established path semantics and
+            // intentionally ignore this presentation preference.
             let hierarchy = try await organizeNotesByHierarchy(notesToExport)
+            let usesSingleFileLayout = configurations.concatenateOutput && format.supportsConcatenation
+            let folderOrganization: ExportFolderOrganization =
+                (isSync || usesSingleFileLayout) ? .asInNotes : configurations.folderOrganization
 
-            // Create all directory structure upfront. Single File writes one
-            // file and no tree, so creating it would leave an empty copy of the
-            // whole folder hierarchy sitting beside that file.
-            if singleFileURL == nil {
+            // Create the hierarchy only when it will be written. In the flat
+            // mode the chosen destination itself is every note's parent folder.
+            if singleFileURL == nil && folderOrganization == .asInNotes {
                 for (accountName, folders) in hierarchy {
                     let accountURL = outputURL.appendingPathComponent(sanitizeExportFilename(accountName))
                     try FileManager.default.createDirectory(at: accountURL, withIntermediateDirectories: true)
@@ -305,8 +569,14 @@ class ExportViewModel: ObservableObject {
                 }
             }
 
-            // Flatten notes with their folder paths for concurrent export
-            let notesWithPaths = flattenExportHierarchy(hierarchy, outputRoot: outputURL)
+            // Preserve the old logical paths for concatenation, where no
+            // individual per-note document path is actually delivered.
+            let placementOrganization = usesSingleFileLayout ? .asInNotes : folderOrganization
+            let notesWithPaths = flattenExportHierarchy(
+                hierarchy,
+                outputRoot: outputURL,
+                organization: placementOrganization
+            )
 
             // Pre-allocate filenames so applenotes:note/UUID internal links can be
             // rewritten to actual relative file paths during rendering.
@@ -318,7 +588,9 @@ class ExportViewModel: ObservableObject {
                 format: format,
                 addDatePrefix: configurations.addDateToFilename,
                 dateFormat: configurations.filenameDateFormat.rawValue,
-                existingManifest: existingManifest
+                existingManifest: existingManifest,
+                includeAttachments: includeAttachments,
+                sharedAttachmentsFolder: configurations.sharedAttachmentsFolder
             )
             defer { self.internalLinkMap = [:] }
 
@@ -357,7 +629,7 @@ class ExportViewModel: ObservableObject {
 
             // Set folder timestamps based on their notes. Single File writes no
             // folder tree, and stamping paths that were never created throws.
-            if singleFileURL == nil {
+            if singleFileURL == nil && folderOrganization == .asInNotes {
                 try await setExportFolderTimestamps(hierarchy: hierarchy, outputURL: outputURL)
             }
 
@@ -408,6 +680,593 @@ class ExportViewModel: ObservableObject {
             exportState = .error(error.localizedDescription)
             Logger.noteExport.error("Export failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Export one note as a self-contained PDF into a user-selected folder.
+    /// This is an opt-in app path; the existing tree, archive, sync, CLI and
+    /// MCP routes continue to use `exportNotes` unchanged.
+    /// Render an in-memory PDF preview through the exact standalone-PDF path
+    /// used by export, while keeping its temporary files and diagnostics isolated
+    /// from the user's selected destination and from the active export model.
+    func generatePDFPreviewData(for note: NotesNote) async throws -> Data {
+        let previewRenderer = ExportViewModel(repository: repository, databasePath: databasePath)
+        previewRenderer.configurations = configurations
+        previewRenderer.suppressExportLogMessages = true
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("apple-notes-exporter-preview-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        await previewRenderer.exportSingleNotePDF(note, toDirectory: directory)
+        try Task.checkCancellation()
+
+        switch previewRenderer.exportState {
+        case .completed:
+            guard let artifactURL = previewRenderer.lastExportArtifactURL,
+                  artifactURL.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else {
+                throw ExportError.invalidGeneratedPDF
+            }
+            let data = try Data(contentsOf: artifactURL, options: [.mappedIfSafe])
+            guard PDFDocument(data: data)?.pageCount ?? 0 > 0 else {
+                throw ExportError.invalidGeneratedPDF
+            }
+            return data
+        case .cancelled:
+            throw CancellationError()
+        case .error(let message):
+            throw NSError(
+                domain: "AppleNotesExporter.PDFPreview",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        case .idle, .exporting:
+            throw ExportError.invalidGeneratedPDF
+        }
+    }
+
+    func exportSingleNotePDF(
+        _ note: NotesNote,
+        toDirectory destinationDirectory: URL
+    ) async {
+        shouldCancel = false
+        exportLog = []
+        failedNotesCount = 0
+        failedAttachmentsCount = 0
+        flatPDFIncompleteAttachmentIDs = []
+        flatPDFVerifiedDataByID = [:]
+        flatPDFPreviewDataByID = [:]
+        flatPDFInvalidPDFIDs = []
+        flatPDFInsertions = []
+        internalLinkMap = [:]
+        lastExportArtifactURL = nil
+        exportState = .exporting(ExportProgress(current: 0, total: 1, message: "Preparing PDF..."))
+
+        var stagingDirectory: URL?
+        defer {
+            if let stagingDirectory {
+                do {
+                    try Self.removeFlatPDFStagingDirectory(at: stagingDirectory)
+                } catch {
+                    log("⚠︎ Could not remove this export's temporary PDF files: \(error.localizedDescription)")
+                }
+            }
+            internalLinkMap = [:]
+            flatPDFVerifiedDataByID = [:]
+            flatPDFPreviewDataByID = [:]
+            flatPDFInvalidPDFIDs = []
+            flatPDFInsertions = []
+        }
+
+        do {
+            try Task.checkCancellation()
+
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: destinationDirectory.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw ExportError.invalidPDFDestinationDirectory(destinationDirectory.lastPathComponent)
+            }
+
+            let staging = try Self.createFlatPDFStagingDirectory()
+            stagingDirectory = staging
+            log("Staging this single-note PDF in a private temporary directory")
+
+            var uniquePDFAttachments: [NotesAttachment] = []
+            var seenPDFAttachmentIDs = Set<String>()
+            for attachment in note.attachments where HTMLAttachmentProcessor.isPDFType(attachment.typeUTI) {
+                if seenPDFAttachmentIDs.insert(attachment.id).inserted {
+                    uniquePDFAttachments.append(attachment)
+                }
+            }
+            var totalPDFBytes = 0
+            for attachment in uniquePDFAttachments {
+                try Task.checkCancellation()
+                if shouldCancel { throw CancellationError() }
+                let name = attachment.filename ?? attachment.name
+                do {
+                    let data = try await repository.fetchAttachment(id: attachment.id, ownedByNoteID: note.id)
+                    guard data.count <= PDFEmbeddedFileWriter.maximumAttachmentBytes else {
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ exceeds the per-file limit and will appear as an unavailable reference.")
+                        continue
+                    }
+                    let total = totalPDFBytes.addingReportingOverflow(data.count)
+                    guard !total.overflow, total.partialValue <= PDFEmbeddedFileWriter.maximumTotalAttachmentBytes else {
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ exceeds the combined attachment limit and will appear as an unavailable reference.")
+                        continue
+                    }
+                    totalPDFBytes = total.partialValue
+                    flatPDFVerifiedDataByID[attachment.id] = data
+
+                    if let document = PDFDocument(data: data), !document.isLocked, document.pageCount > 0 {
+                        log("Verified original PDF bytes for ‘\(name)’; the attachment’s pages will not be added to the note PDF.")
+                        if configurations.pdf.attachmentMode == .previewAndEmbed {
+                            if let preview = HTMLAttachmentProcessor.pdfPreviewData(from: data) {
+                                flatPDFPreviewDataByID[attachment.id] = preview
+                            } else {
+                                log("⚠︎ A compact preview could not be rendered for ‘\(name)’; the original file will still be embedded.")
+                            }
+                        }
+                    } else {
+                        flatPDFInvalidPDFIDs.insert(attachment.id)
+                        flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                        log("⚠︎ PDF attachment ‘\(name)’ appears damaged or locked; its original bytes will be embedded without a preview, but the reader may not open it.")
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    flatPDFIncompleteAttachmentIDs.insert(attachment.id)
+                    log("⚠︎ PDF attachment ‘\(name)’ is missing or could not be read; an unavailable reference will remain in the note.")
+                }
+            }
+
+            var attachmentPaths: [String: String] = [:]
+            let inlineImageAttachments = note.attachments.filter {
+                HTMLAttachmentProcessor.isInlineImageType($0.typeUTI)
+                    && $0.typeUTI != "com.apple.notes.gallery"
+            }
+            if !inlineImageAttachments.isEmpty {
+                // Stage only image sources that may be needed to render inline.
+                // Other files are not delivered by this single-PDF mode and must
+                // not be logged as exported before their staging copy is deleted.
+                let attachmentResult = try await exportNoteAttachments(
+                    inlineImageAttachments,
+                    toDirectory: staging,
+                    outputRoot: staging,
+                    noteBaseName: Self.safeFlatPDFBaseName(note.title),
+                    noteTitle: note.title,
+                    creationDate: note.creationDate,
+                    modificationDate: note.modificationDate,
+                    sharedAttachmentsFolder: false,
+                    repository: repository
+                )
+                attachmentPaths = attachmentResult.paths
+                for event in attachmentResult.events {
+                    let message = event.message
+                        .replacingOccurrences(of: "Exported attachment:", with: "Prepared temporary inline image source:")
+                        .replacingOccurrences(of: "Failed to export attachment -", with: "Could not prepare a temporary inline image source -")
+                    log(message)
+                }
+            }
+
+            try Task.checkCancellation()
+            if shouldCancel { throw CancellationError() }
+
+            let pdfConfig = configurations.pdf
+            let pageSize = pdfConfig.pageSize.dimensions
+            let pdfHTMLConfig = pdfConfig.htmlConfiguration
+            var standaloneHTMLConfig = pdfHTMLConfig
+            // A final PDF must not rely on images in the temporary staging
+            // folder or on user preferences that disable inline images.
+            standaloneHTMLConfig.embedImagesInline = true
+            standaloneHTMLConfig.linkEmbeddedImages = false
+
+            let html = try await generateHTML(
+                for: note,
+                config: standaloneHTMLConfig,
+                forPDF: true,
+                attachmentPaths: attachmentPaths,
+                exportDirectory: staging,
+                pdfPageSize: CGSize(width: pageSize.width, height: pageSize.height),
+                pdfMargins: standaloneHTMLConfig.toNSEdgeInsets(),
+                standalonePDF: true
+            )
+
+            let stagedPDF = staging.appendingPathComponent("rendered.pdf")
+            let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
+            log("Rendering standalone PDF...")
+            let paginatedHTML = pdfHTMLWithPageGeometry(html, pageSize: pageSizeCG)
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: stagedPDF,
+                pageSize: pageSizeCG,
+                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+            )
+
+            var stagedPDFForDelivery = stagedPDF
+            if !flatPDFInsertions.isEmpty {
+                try Task.checkCancellation()
+                if shouldCancel { throw CancellationError() }
+                let attachedPDF = staging.appendingPathComponent("rendered-with-attachments.pdf")
+                let result = try PDFEmbeddedFileWriter.addAttachments(
+                    flatPDFInsertions,
+                    to: stagedPDF,
+                    writingTo: attachedPDF
+                ) {
+                    try Task.checkCancellation()
+                    if self.shouldCancel { throw CancellationError() }
+                }
+                guard let renderedDocument = PDFDocument(url: stagedPDF),
+                      result.pageCount == renderedDocument.pageCount else {
+                    throw PDFEmbeddedFileWriterError.invalidOutputPDF
+                }
+                stagedPDFForDelivery = attachedPDF
+                log("Embedded \(result.embeddedFileCount) unique PDF attachment(s); note page count remains \(result.pageCount).")
+            }
+
+            try Task.checkCancellation()
+            if shouldCancel { throw CancellationError() }
+
+            try setExportFileTimestamps(
+                stagedPDFForDelivery,
+                creationDate: note.creationDate,
+                modificationDate: note.modificationDate
+            )
+
+            let finalURL = try Self.moveFlatPDFWithoutOverwriting(
+                stagedPDFForDelivery,
+                noteTitle: note.title,
+                toDirectory: destinationDirectory
+            )
+            // The defer removes staged image sources on every exit path, after
+            // the final PDF has been moved out of the private staging folder.
+            // Record delivery first so cleanup errors do not falsely imply the
+            // final PDF itself was not written.
+            lastExportArtifactURL = finalURL
+            failedAttachmentsCount = flatPDFIncompleteAttachmentIDs.count
+
+            if failedAttachmentsCount > 0 {
+                log("⚠︎ PDF created with \(failedAttachmentsCount) attachment(s) not fully preserved; see attachment warnings above.")
+            }
+            log("✓ Wrote standalone PDF: \(finalURL.lastPathComponent)")
+            exportState = .completed(ExportStatistics(
+                successfulNotes: 1,
+                failedNotes: 0,
+                failedAttachments: failedAttachmentsCount,
+                completionDate: Date()
+            ))
+        } catch is CancellationError {
+            exportState = .cancelled
+            log("Export cancelled; temporary PDF files will be removed")
+        } catch {
+            failedNotesCount = 1
+            exportState = .error(error.localizedDescription)
+            log("✗ Failed to export standalone PDF for '\(note.title)': \(error.localizedDescription)")
+            if !suppressExportLogMessages {
+                Logger.noteExport.error("Standalone PDF export failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Render and atomically write a PDF using a WebKit view owned by this
+    /// main-actor-isolated export. HtmlToPdf's renderer enters its dependency
+    /// cache from a task-group worker; under Xcode 27's XCTest context this
+    /// crashes while reflecting Swift Testing's current Test.ID. Keeping
+    /// WebKit creation, navigation, and PDF capture on MainActor avoids that
+    /// dependency path and gives this export explicit ownership of the view.
+    ///
+    /// The timeout/cancellation tasks are structured: on either event they
+    /// stop outstanding navigation and cancel the render child, but leaving
+    /// this scope also waits for AppKit's in-flight print callback. AppKit
+    /// exposes no cancellation method for a running NSPrintOperation, so a
+    /// cancellation can take until printing completes. The PDF is written only after
+    /// that callback completes, cancellation is rechecked, and PDFKit validates
+    /// the resulting document. This avoids abandoned render tasks and partial
+    /// output files. If WebKit is unresponsive during PDF capture, cancellation
+    /// may take until WebKit completes; we deliberately do not return while it
+    /// can still be rendering.
+    private func renderPDFHTML(
+        _ html: String,
+        to url: URL,
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL? = nil,
+        timeoutSeconds: UInt64 = 60
+    ) async throws {
+        try await PDFRenderCoordinator.shared.withExclusiveAccess {
+            try await self.renderPDFHTMLExclusive(
+                html,
+                to: url,
+                pageSize: pageSize,
+                margins: margins,
+                baseURL: baseURL,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    }
+
+    private func renderPDFHTMLExclusive(
+        _ html: String,
+        to url: URL,
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL?,
+        timeoutSeconds: UInt64
+    ) async throws {
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        let renderID = UUID()
+        let timeoutNanoseconds = timeoutSeconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let timeout = timeoutNanoseconds.overflow ? UInt64.max : timeoutNanoseconds.partialValue
+        let pdfData: Data
+        do {
+            pdfData = try await withThrowingTaskGroup(of: Data.self) { group in
+                group.addTask { @MainActor in
+                    try await self.createPDFData(
+                        html,
+                        pageSize: pageSize,
+                        margins: margins,
+                        baseURL: baseURL,
+                        renderID: renderID
+                    )
+                }
+                group.addTask { [weak self] in
+                    try await Task.sleep(nanoseconds: timeout)
+                    await self?.markPDFRenderTimedOutAndStop(renderID)
+                    throw ExportError.pdfGenerationTimeout
+                }
+                group.addTask { [weak self] in
+                    do {
+                        while true {
+                            try Task.checkCancellation()
+                            guard let self else { throw CancellationError() }
+                            if await self.isPDFCancellationRequested() {
+                                await self.stopPDFRender(renderID)
+                                throw CancellationError()
+                            }
+                            try await Task.sleep(nanoseconds: 50_000_000)
+                        }
+                    } catch {
+                        // Task.sleep itself throws on cancellation. Always
+                        // stop this render before the task-group joins it.
+                        await self?.stopPDFRender(renderID)
+                        throw error
+                    }
+                }
+
+                guard let data = try await group.next() else {
+                    throw ExportError.invalidGeneratedPDF
+                }
+                group.cancelAll()
+                return data
+            }
+        } catch {
+            if timedOutPDFRenderIDs.remove(renderID) != nil {
+                throw ExportError.pdfGenerationTimeout
+            }
+            if Task.isCancelled || shouldCancel { throw CancellationError() }
+            throw error
+        }
+        if timedOutPDFRenderIDs.remove(renderID) != nil {
+            throw ExportError.pdfGenerationTimeout
+        }
+
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        guard let document = PDFDocument(data: pdfData), document.pageCount > 0 else {
+            throw ExportError.invalidGeneratedPDF
+        }
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        try pdfData.write(to: url, options: .atomic)
+    }
+
+    @MainActor
+    private func createPDFData(
+        _ html: String,
+        pageSize: CGSize,
+        margins: NSEdgeInsets,
+        baseURL: URL?,
+        renderID: UUID
+    ) async throws -> Data {
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        let webViewConfiguration = try await PDFWebViewIsolation.makeConfiguration()
+        let webView = WKWebView(
+            frame: CGRect(origin: .zero, size: pageSize),
+            configuration: webViewConfiguration
+        )
+        let navigationDelegate = PDFNavigationDelegate()
+        activePDFWebViews[renderID] = webView
+        activePDFNavigationDelegates[renderID] = navigationDelegate
+        webView.navigationDelegate = navigationDelegate
+        defer {
+            webView.stopLoading()
+            webView.navigationDelegate = nil
+            activePDFNavigationDelegates.removeValue(forKey: renderID)
+            activePDFWebViews.removeValue(forKey: renderID)
+        }
+
+        try await navigationDelegate.load(html, in: webView, baseURL: baseURL)
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+
+        // WKWebView.pdf(configuration:) captures a rectangle and clips a long
+        // document instead of invoking automatic print pagination. Use the
+        // same WebKit/AppKit print path as HtmlToPdf, but directly here: this
+        // avoids its dependency-backed WebViewPool lookup while retaining the
+        // configured page size, margins, pagination, selectable text, and
+        // original data-URI images.
+        let renderDirectory = try Self.createFlatPDFStagingDirectory()
+        defer {
+            do {
+                try Self.removeFlatPDFStagingDirectory(at: renderDirectory)
+            } catch {
+                log("⚠︎ Could not remove this PDF render's temporary files: \(error.localizedDescription)")
+            }
+        }
+        let renderedURL = renderDirectory.appendingPathComponent("rendered.pdf")
+        let printInfo = NSPrintInfo(dictionary: [
+            .jobDisposition: NSPrintInfo.JobDisposition.save,
+            .jobSavingURL: renderedURL,
+            .allPages: true,
+            .topMargin: margins.top,
+            .bottomMargin: margins.bottom,
+            .leftMargin: margins.left,
+            .rightMargin: margins.right,
+            .paperSize: pageSize,
+            .verticalPagination: NSNumber(value: NSPrintInfo.PaginationMode.automatic.rawValue)
+        ])
+        let operation = webView.printOperation(with: printInfo)
+        operation.showsPrintPanel = false
+        operation.showsProgressPanel = false
+        operation.canSpawnSeparateThread = true
+        log("Printing standalone PDF pages...")
+        let printDelegate = PDFPrintOperationDelegate()
+        try await printDelegate.run(operation, window: webView.window ?? NSWindow())
+        try Task.checkCancellation()
+        if shouldCancel { throw CancellationError() }
+        guard let document = PDFDocument(url: renderedURL), document.pageCount > 0 else {
+            throw ExportError.invalidGeneratedPDF
+        }
+        return try Data(contentsOf: renderedURL)
+    }
+
+    @MainActor
+    private func isPDFCancellationRequested() -> Bool {
+        shouldCancel
+    }
+
+    @MainActor
+    private func markPDFRenderTimedOutAndStop(_ renderID: UUID) {
+        timedOutPDFRenderIDs.insert(renderID)
+        // AppKit exposes no cancel method for a running NSPrintOperation. Stop
+        // navigation immediately; if printing has started, the structured
+        // render child remains joined until its print callback completes.
+        stopPDFRender(renderID)
+    }
+
+    @MainActor
+    private func stopPDFRender(_ renderID: UUID) {
+        activePDFNavigationDelegates[renderID]?.cancel()
+        activePDFWebViews[renderID]?.stopLoading()
+    }
+
+    /// Add explicit print-page geometry without changing the shared legacy HTML
+    /// wrapper used by HTML, CLI, or MCP exporters.
+    private func pdfHTMLWithPageGeometry(
+        _ html: String,
+        pageSize: CGSize
+    ) -> String {
+        func points(_ value: CGFloat) -> String { String(Double(value)) }
+        let pageStyle = """
+        <style id="ane-standalone-pdf-page">
+        @page { size: \(points(pageSize.width))pt \(points(pageSize.height))pt; }
+        </style>
+        """
+        if let headEnd = html.range(of: "</head>", options: .caseInsensitive) {
+            var output = html
+            output.insert(contentsOf: pageStyle, at: headEnd.lowerBound)
+            return output
+        }
+        if let bodyEnd = html.range(of: "</body>", options: .caseInsensitive) {
+            var output = html
+            output.insert(contentsOf: pageStyle, at: bodyEnd.lowerBound)
+            return output
+        }
+        return pageStyle + html
+    }
+
+    static func moveFlatPDFWithoutOverwriting(
+        _ stagedPDF: URL,
+        noteTitle: String,
+        toDirectory destinationDirectory: URL
+    ) throws -> URL {
+        let fileManager = FileManager.default
+        let deliveryStagingDirectory = destinationDirectory.appendingPathComponent(
+            flatPDFDeliveryStagingDirectoryPrefix + UUID().uuidString,
+            isDirectory: true
+        )
+        // Build a private, same-volume delivery stage. The main renderer can
+        // stage under the system temp directory (which may be on another
+        // volume); this final sibling move is therefore a rename, not a
+        // cross-volume copy that could expose a partially written destination.
+        try fileManager.createDirectory(
+            at: deliveryStagingDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? fileManager.removeItem(at: deliveryStagingDirectory) }
+
+        let directoryPermissions = try fileManager.attributesOfItem(atPath: deliveryStagingDirectory.path)[.posixPermissions] as? NSNumber
+        guard let directoryPermissions, directoryPermissions.intValue & 0o077 == 0 else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteNoPermissionError,
+                userInfo: [NSLocalizedDescriptionKey: "The destination volume cannot provide private staging for an atomic PDF write."]
+            )
+        }
+        let stagedPermissions = try fileManager.attributesOfItem(atPath: stagedPDF.path)[.posixPermissions] as? NSNumber
+        let deliveryPDF = deliveryStagingDirectory.appendingPathComponent("payload.pdf")
+        try fileManager.copyItem(at: stagedPDF, to: deliveryPDF)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: deliveryPDF.path)
+        let filePermissions = try fileManager.attributesOfItem(atPath: deliveryPDF.path)[.posixPermissions] as? NSNumber
+        guard let filePermissions, filePermissions.intValue & 0o077 == 0 else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteNoPermissionError,
+                userInfo: [NSLocalizedDescriptionKey: "The destination volume cannot protect the staged PDF during atomic delivery."]
+            )
+        }
+        if let stagedPermissions {
+            // Restore the renderer's normal output mode while the file is still
+            // inaccessible inside the private directory; preserve normal user
+            // access on the delivered PDF instead of forcing it to 0600.
+            try fileManager.setAttributes([.posixPermissions: stagedPermissions.intValue], ofItemAtPath: deliveryPDF.path)
+        }
+
+        let baseName = safeFlatPDFBaseName(noteTitle)
+
+        for collisionNumber in 1...10_000 {
+            let filename = collisionNumber == 1
+                ? "\(baseName).pdf"
+                : "\(baseName) (\(collisionNumber)).pdf"
+            let destination = destinationDirectory.appendingPathComponent(filename)
+            guard !fileManager.fileExists(atPath: destination.path) else { continue }
+
+            do {
+                // Both paths are on the destination volume. FileManager refuses
+                // an existing destination, so the completed file appears in a
+                // single same-volume move and never replaces a user's PDF.
+                try fileManager.moveItem(at: deliveryPDF, to: destination)
+                try? fileManager.removeItem(at: stagedPDF)
+                return destination
+            } catch {
+                // A competing export may have claimed the same name after
+                // the preflight check. Retry only if that exact path now
+                // exists; propagate unrelated I/O and permission failures.
+                if fileManager.fileExists(atPath: destination.path) { continue }
+                throw error
+            }
+        }
+
+        throw ExportError.tooManyPDFNameCollisions
+    }
+
+    private static func safeFlatPDFBaseName(_ title: String) -> String {
+        let sanitized = sanitizeExportFilename(title).trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? "Untitled Note" : sanitized
     }
 
     /// Export notes concurrently using TaskGroup
@@ -589,23 +1448,20 @@ class ExportViewModel: ObservableObject {
             // For PDF, the concatenated content is HTML — render it
             let pdfConfig = configurations.pdf
             let pageSize = pdfConfig.pageSize.dimensions
-            let margins = pdfConfig.htmlConfiguration.toPDFEdgeInsets()
-            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
-                margins: margins,
-                paperSize: CGSize(width: pageSize.width, height: pageSize.height)
+            let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
+            let marginsNS = pdfConfig.htmlConfiguration.toNSEdgeInsets()
+            let paginatedHTML = pdfHTMLWithPageGeometry(
+                concatenated,
+                pageSize: pageSizeCG
             )
-
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await concatenated.print(to: fileURL, configuration: pdfConfiguration)
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(totalNotes) * 60_000_000_000)
-                    throw ExportError.pdfGenerationTimeout
-                }
-                try await group.next()
-                group.cancelAll()
-            }
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: fileURL,
+                pageSize: pageSizeCG,
+                margins: marginsNS,
+                baseURL: outputURL,
+                timeoutSeconds: UInt64(max(1, totalNotes)) * 60
+            )
         } else {
             try concatenated.write(to: fileURL, atomically: true, encoding: .utf8)
         }
@@ -752,8 +1608,6 @@ class ExportViewModel: ObservableObject {
 
             // Apply page size and margin configuration
             let pageSize = pdfConfig.pageSize.dimensions
-            let margins = pdfConfig.htmlConfiguration.toPDFEdgeInsets()
-
             // Generate HTML with PDF-specific constraints
             let pageSizeCG = CGSize(width: pageSize.width, height: pageSize.height)
             let marginsNS = pdfConfig.htmlConfiguration.toNSEdgeInsets()
@@ -767,29 +1621,17 @@ class ExportViewModel: ObservableObject {
                 pdfPageSize: pageSizeCG,
                 pdfMargins: marginsNS
             )
-            let pdfConfiguration = HtmlToPdf.PDFConfiguration(
-                margins: margins,
-                paperSize: pageSizeCG
+            let paginatedHTML = pdfHTMLWithPageGeometry(
+                html,
+                pageSize: pageSizeCG
             )
-
-            // Add timeout for PDF generation to prevent infinite hangs on corrupted images
-            // Notes with many images can take 30+ seconds to render
-            // HEIC conversion to JPEG helps, but timeout still needed for truly corrupted files
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await html.print(to: fileURL, configuration: pdfConfiguration)
-                }
-
-                group.addTask {
-                    // 60 second timeout - allows image-heavy notes to render while catching infinite hangs
-                    try await Task.sleep(nanoseconds: 60_000_000_000)
-                    throw ExportError.pdfGenerationTimeout
-                }
-
-                // Wait for first task to complete (either PDF finishes or timeout)
-                try await group.next()
-                group.cancelAll()
-            }
+            try await renderPDFHTML(
+                paginatedHTML,
+                to: fileURL,
+                pageSize: pageSizeCG,
+                margins: NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0),
+                baseURL: directory
+            )
 
             log("✓ Exported PDF: \(note.title)")
         } else if format.isBinaryFormat {
@@ -871,6 +1713,7 @@ class ExportViewModel: ObservableObject {
 
     /// Add a log entry (thread-safe)
     private func log(_ message: String) {
+        guard !suppressExportLogMessages else { return }
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         logLock.lock()
         defer { logLock.unlock() }
@@ -976,7 +1819,7 @@ class ExportViewModel: ObservableObject {
 
     // MARK: - Content Generation
 
-    private func generateHTML(
+    func generateHTML(
         for note: NotesNote,
         config: HTMLConfiguration? = nil,
         forPDF: Bool = false,
@@ -984,7 +1827,8 @@ class ExportViewModel: ObservableObject {
         exportDirectory: URL? = nil,
         targetFormat: ExportFormat? = nil,
         pdfPageSize: CGSize? = nil,
-        pdfMargins: NSEdgeInsets? = nil
+        pdfMargins: NSEdgeInsets? = nil,
+        standalonePDF: Bool = false
     ) async throws -> String {
         let dateFormatter = DateFormatter()
         dateFormatter.dateStyle = .medium
@@ -1007,7 +1851,10 @@ class ExportViewModel: ObservableObject {
                 htmlBody = try await repository.generateHTML(forNoteId: note.id)
             } catch {
                 // Fallback to plaintext if HTML generation fails (corrupted protobuf, etc.)
-                Logger.noteExport.warning("Failed to generate HTML for note \(note.id), falling back to plaintext: \(error)")
+                Logger.noteExport.warning("Failed to generate rich note HTML; falling back to plaintext.")
+                if standalonePDF {
+                    log("⚠︎ Rich note content could not be generated; the PDF uses a plain-text fallback.")
+                }
                 htmlBody = plaintextFallbackHTMLDocument(plaintext: note.plaintext)
             }
         }
@@ -1026,9 +1873,13 @@ class ExportViewModel: ObservableObject {
         // since we wrap the content in our own full HTML document below.
         var processedHTML = linkRewrittenBody
 
-        // Only process attachments if we have a database connection and attachments to process
-        if !note.attachments.isEmpty {
-            // Open a C parser handle and extract the sqlite3 pointer for HTMLAttachmentProcessor
+        // Only process attachments if we have a database connection and attachments to process.
+        // A standalone PDF additionally records any attachment that cannot be
+        // represented by bytes inside the PDF; temporary sibling links are not
+        // a valid fallback for a single-file deliverable.
+        let hasStandalonePDFMarkers = standalonePDF
+            && HTMLAttachmentProcessor.containsAttachmentMarkers(in: linkRewrittenBody)
+        if !note.attachments.isEmpty || hasStandalonePDFMarkers {
             if let parserHandle = ane_open(databasePath) {
                 defer { ane_close(parserHandle) }
                 if let rawHandle = ane_get_sqlite_handle(parserHandle) {
@@ -1040,9 +1891,44 @@ class ExportViewModel: ObservableObject {
                         attachmentPaths: attachmentPaths,
                         exportDirectory: exportDirectory?.path,
                         embedImages: htmlConfig.embedImagesInline,
-                        linkEmbeddedImages: htmlConfig.linkEmbeddedImages
+                        linkEmbeddedImages: htmlConfig.linkEmbeddedImages,
+                        standalonePDF: standalonePDF,
+                        verifiedPDFDataByID: standalonePDF ? flatPDFVerifiedDataByID : [:],
+                        pdfPreviewDataByID: standalonePDF ? flatPDFPreviewDataByID : [:],
+                        invalidPDFIDs: standalonePDF ? flatPDFInvalidPDFIDs : [],
+                        pdfAttachmentMode: configurations.pdf.attachmentMode
+                    )
+                    if standalonePDF {
+                        flatPDFIncompleteAttachmentIDs.formUnion(processor.incompleteAttachmentIDs)
+                        flatPDFInsertions.append(contentsOf: processor.embeddedPDFInsertions)
+                        for diagnostic in processor.diagnostics {
+                            log("⚠︎ \(diagnostic)")
+                        }
+                        for notice in processor.notices {
+                            log("ℹ︎ \(notice)")
+                        }
+                    }
+                } else if standalonePDF {
+                    processedHTML = replaceUnavailablePDFAttachmentMarkers(
+                        in: linkRewrittenBody,
+                        attachments: note.attachments,
+                        reason: "The Notes database attachment handle was unavailable",
+                        verifiedPDFDataByID: flatPDFVerifiedDataByID,
+                        pdfPreviewDataByID: flatPDFPreviewDataByID,
+                        invalidPDFIDs: flatPDFInvalidPDFIDs,
+                        pdfAttachmentMode: configurations.pdf.attachmentMode
                     )
                 }
+            } else if standalonePDF {
+                processedHTML = replaceUnavailablePDFAttachmentMarkers(
+                    in: linkRewrittenBody,
+                    attachments: note.attachments,
+                    reason: "The Notes database could not be opened to verify attachment data",
+                    verifiedPDFDataByID: flatPDFVerifiedDataByID,
+                    pdfPreviewDataByID: flatPDFPreviewDataByID,
+                    invalidPDFIDs: flatPDFInvalidPDFIDs,
+                    pdfAttachmentMode: configurations.pdf.attachmentMode
+                )
             }
         }
 
@@ -1052,13 +1938,42 @@ class ExportViewModel: ObservableObject {
         // so any note with an attachment kept a nested <html><body>.
         processedHTML = extractHTMLBody(processedHTML)
 
-        // Build CSS for font and margin
+        if forPDF {
+            let configuredSize = configurations.pdf.pageSize.dimensions
+            let options = PDFDocumentOptions(
+                profile: configurations.pdf.styleProfile,
+                pageSize: pdfPageSize ?? CGSize(width: configuredSize.width, height: configuredSize.height),
+                pageMargins: pdfMargins ?? htmlConfig.toNSEdgeInsets(),
+                fontFamily: htmlConfig.fontFamily.cssFontStack,
+                baseFontSizePoints: htmlConfig.fontSizePoints,
+                // WebKit honors CSS @page margins but ignores NSPrintInfo
+                // margins for this content. Apply the configured margin in CSS
+                // and pass zero to NSPrintInfo so it is applied exactly once.
+                embedPageMarginsInCSS: true,
+                showHeader: false,
+                customCSS: """
+                .ane-pdf-attachment-card { display: flex; align-items: center; gap: 10px; max-width: 420px; margin: 9px 0 12px; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #f8fafc; break-inside: avoid; page-break-inside: avoid; }
+                .ane-pdf-attachment-preview { display: block; width: auto; height: auto; max-width: 80px; max-height: 108px; margin: 0 !important; object-fit: contain; border: 1px solid #e5e7eb; border-radius: 3px; box-shadow: none !important; }
+                .ane-pdf-attachment-card figcaption { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 8px; min-width: 0; }
+                .ane-pdf-attachment-icon { display: inline-block; padding: 2px 4px; border-radius: 3px; background: #b91c1c; color: white; font: 700 7pt -apple-system, sans-serif; }
+                .ane-pdf-attachment-name { overflow-wrap: anywhere; font-size: 9pt; font-weight: 600; }
+                .ane-pdf-attachment-status { grid-column: 1 / -1; color: #475569; font-size: 7pt; }
+                """
+            )
+            return notePDFHTMLDocument(
+                title: note.title,
+                created: dateFormatter.string(from: note.creationDate),
+                modified: dateFormatter.string(from: note.modificationDate),
+                options: options,
+                body: processedHTML
+            )
+        }
+
+        // Keep the legacy document wrapper for non-PDF exports. CLI/MCP use
+        // their independent compatibility path and are not changed here.
         let fontFamily = htmlConfig.fontFamily.cssFontStack
         let fontSize = "\(htmlConfig.fontSizePoints)pt"
-
-        // For PDF, margins are handled by PDFConfiguration (set body margin to 0)
-        // For HTML export, use the configured margin value
-        let marginValue = forPDF ? "0" : "\(htmlConfig.marginSize)\(htmlConfig.marginUnit.displayName)"
+        let marginValue = "\(htmlConfig.marginSize)\(htmlConfig.marginUnit.displayName)"
 
         return noteHTMLDocument(
             title: note.title,
@@ -1067,10 +1982,52 @@ class ExportViewModel: ObservableObject {
             fontFamily: fontFamily,
             fontSize: fontSize,
             margin: marginValue,
-            imageConstraint: imageHeightConstraint(
-                forPDF: forPDF, pageSize: pdfPageSize, margins: pdfMargins),
+            imageConstraint: imageHeightConstraint(forPDF: false, pageSize: nil, margins: nil),
             body: processedHTML
         )
+    }
+
+    private func recordFlatPDFAttachmentFailure(_ attachments: [NotesAttachment], reason: String) {
+        flatPDFIncompleteAttachmentIDs.formUnion(attachments.map(\.id))
+        for attachment in attachments {
+            let label = attachment.filename ?? attachment.id
+            log("⚠︎ Attachment '\(label)' was not verified for the PDF: \(reason).")
+        }
+    }
+
+    private func replaceUnavailablePDFAttachmentMarkers(
+        in html: String,
+        attachments: [NotesAttachment],
+        reason: String,
+        verifiedPDFDataByID: [String: Data],
+        pdfPreviewDataByID: [String: Data],
+        invalidPDFIDs: Set<String>,
+        pdfAttachmentMode: PDFAttachmentMode
+    ) -> String {
+        let fallback = HTMLAttachmentProcessor.replaceUnavailableMarkersWithoutDatabase(
+            in: html,
+            attachments: attachments,
+            reason: reason,
+            verifiedPDFDataByID: verifiedPDFDataByID,
+            pdfPreviewDataByID: pdfPreviewDataByID,
+            invalidPDFIDs: invalidPDFIDs,
+            pdfAttachmentMode: pdfAttachmentMode
+        )
+        flatPDFIncompleteAttachmentIDs.formUnion(fallback.incompleteAttachmentIDs)
+        flatPDFInsertions.append(contentsOf: fallback.embeddedPDFInsertions)
+        for diagnostic in fallback.diagnostics {
+            log("⚠︎ \(diagnostic)")
+        }
+
+        // Preserve reporting for attachments without inline markers while
+        // avoiding duplicate warnings for markers replaced by the fallback.
+        let fallbackRepresentedPDFIDs = Set(fallback.embeddedPDFInsertions.map(\.attachmentID))
+        let unrepresentedAttachments = attachments.filter {
+            !fallback.incompleteAttachmentIDs.contains($0.id)
+                && !fallbackRepresentedPDFIDs.contains($0.id)
+        }
+        recordFlatPDFAttachmentFailure(unrepresentedAttachments, reason: reason)
+        return fallback.html
     }
 
     // MARK: - Helper Methods

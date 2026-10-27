@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B0F100000000000000000001 /* PDFEmbeddedFileWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F100000000000000000002 /* PDFEmbeddedFileWriter.swift */; };
 		1C4D45247207F83682A109C7 /* ExportLogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17B94ED64713116D6A12BAFA /* ExportLogView.swift */; };
 		250816942F527B6400CD5778 /* AppleNotesKit.c in Sources */ = {isa = PBXBuildFile; fileRef = 2508168E2F527B6400CD5778 /* AppleNotesKit.c */; };
 		250816962F527BBB00CD5778 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 250816952F527BBB00CD5778 /* libsqlite3.tbd */; };
@@ -165,6 +166,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		B0F100000000000000000002 /* PDFEmbeddedFileWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFEmbeddedFileWriter.swift; sourceTree = "<group>"; };
 		112D188009F1E92C1561588B /* NotesRepository.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = NotesRepository.swift; path = Repository/NotesRepository.swift; sourceTree = "<group>"; };
 		17B94ED64713116D6A12BAFA /* ExportLogView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ExportLogView.swift; sourceTree = "<group>"; };
 		213C2B20532A819D34D10996 /* NotesModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = NotesModels.swift; path = Models/NotesModels.swift; sourceTree = "<group>"; };
@@ -343,6 +345,7 @@
 				AAAA000000000001LICENSES /* Licenses */,
 				257242452BF18F7700BD9A67 /* utilities.swift */,
 				EE00000000000000000XSUPP /* ExportSupport.swift */,
+				B0F100000000000000000002 /* PDFEmbeddedFileWriter.swift */,
 				257E911E2BF26FC10052606E /* ExportView.swift */,
 				257E91202BF26FD30052606E /* NoteSelectorView.swift */,
 				2519EE832E3AEA7200CC5D3C /* LicensePermissionsView.swift */,
@@ -684,6 +687,7 @@
 				B2D4E9A1F3C8A7B5D6E0F123 /* SyncManifest.swift in Sources */,
 				CD247032451BCF2264B446AC /* FormatOptionsView.swift in Sources */,
 				F6A42B2B6E8AFF8161AA22CE /* HTMLAttachmentProcessor.swift in Sources */,
+				B0F100000000000000000001 /* PDFEmbeddedFileWriter.swift in Sources */,
 				AP0000000000000000ENGN /* CLIExportEngine.swift in Sources */,
 				AP0000000000000000OUTP /* CLIOutput.swift in Sources */,
 				AP0000000000000000ERRO /* CLIError.swift in Sources */,

@@ -1,12 +1,12 @@
 # Apple Notes Exporter (apple-notes-exporter)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![macOS 11.0+](https://img.shields.io/badge/macOS-11.0%2B-brightgreen.svg)](https://www.apple.com/macos/)
-[![Latest Release](https://img.shields.io/github/v/release/kzaremski/apple-notes-exporter)](https://github.com/kzaremski/apple-notes-exporter/releases/latest)
-[![GitHub Downloads](https://img.shields.io/github/downloads/kzaremski/apple-notes-exporter/total)](https://github.com/kzaremski/apple-notes-exporter/releases)
-[![GitHub Stars](https://img.shields.io/github/stars/kzaremski/apple-notes-exporter)](https://github.com/kzaremski/apple-notes-exporter/stargazers)
-[![GitHub Issues](https://img.shields.io/github/issues/kzaremski/apple-notes-exporter)](https://github.com/kzaremski/apple-notes-exporter/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/kzaremski/apple-notes-exporter)](https://github.com/kzaremski/apple-notes-exporter/commits/main)
+[![macOS 27.0.1 tested](https://img.shields.io/badge/macOS-27.0.1%20tested-brightgreen.svg)](https://www.apple.com/macos/)
+[![Latest Release](https://img.shields.io/github/v/release/SimoGatti04/apple-notes-exporter?include_prereleases)](https://github.com/SimoGatti04/apple-notes-exporter/releases)
+[![GitHub Downloads](https://img.shields.io/github/downloads/SimoGatti04/apple-notes-exporter/total)](https://github.com/SimoGatti04/apple-notes-exporter/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/SimoGatti04/apple-notes-exporter)](https://github.com/SimoGatti04/apple-notes-exporter/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/SimoGatti04/apple-notes-exporter)](https://github.com/SimoGatti04/apple-notes-exporter/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/SimoGatti04/apple-notes-exporter)](https://github.com/SimoGatti04/apple-notes-exporter/commits/main)
 [![Swift](https://img.shields.io/badge/Swift-5-orange.svg)](https://swift.org/)
 
 MacOS app written in Swift that bulk exports Apple Notes (including iCloud Notes) to a multitude of formats preserving note folder structure.
@@ -18,6 +18,12 @@ Built by [Konstantin Zaremski](https://konstantin.zarem.ski)
 ## Purpose & Rationale
 
 Many choose to do all of their note taking and planning through Apple Notes because of the simplicity and convenience that it offers. Unfortunately, there is no good workflow or mechanism built into Apple Notes that allows you to export all your notes or a group of your notes at once.  This app provides a fast, efficient way to export your entire notes library while maintaining the folder hierarchy and preserving formatting.
+
+## Notes to PDF Beta — v0.1.0-beta.1
+
+This fork adds a separate Notes-to-PDF workflow. It exports one PDF per selected note, with **Faithful** and **Study** layouts, multi-note selection, preview, and compact PDF-attachment references. PDF attachments are embedded as original files when available; their pages are not appended to the note PDF. This is a public beta, not a lossless conversion or a replacement for keeping a backup of your notes.
+
+See [`docs/notes-to-pdf/RELEASE_NOTES_v0.1.0-beta.1.md`](docs/notes-to-pdf/RELEASE_NOTES_v0.1.0-beta.1.md) for installation, requirements, SHA-256 verification, licensing, and known limitations.
 
 ## What's New in v2.1
 

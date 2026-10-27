@@ -1,6 +1,12 @@
 # Architecture and integration contracts
 
-Status: initial design contract for independent worktrees. No code implementation implied. Change shared contracts only via integrator review, not concurrent agent edits.
+Status: design contract implemented through the P3 app integration checkpoint on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). This is not a claim that every target capability below is implemented or that real-library/UI acceptance is complete. Change shared contracts only via integrator review, not concurrent agent edits.
+
+## Current implementation snapshot
+- Parser semantic classes are consumed by the PDF styling helper in the app's standalone PDF path. Monostile multiline block-boundary reconstruction remains an open experimental question (F2/P2.2-E); do not infer original block boundaries from visual line breaks alone.
+- The app persists Faithful/Study selection (Study default). Multiple selected notes export as separate flat PDFs through the shared selection/output flow; merge-to-one-PDF is deferred. Visible checklist state is separate from navigation focus.
+- CSS owns standalone PDF page margins while AppKit print margins are zero, avoiding the previously identified double-margin path. The explicit-project launcher is `scripts/run-integration-app.sh`; the stale-UI ⌘R root cause remains undetermined.
+- Inline images and supported HTML render in place. PDF attachment markers remain inline as compact cards; the user chooses Preview + embed or Embed only, independently of Faithful/Study. The original PDF bytes are preserved as document-level embedded files where available and authorized; attachment pages are never added to the note page tree. Size limits, ownership checks, private staging, and fail-closed error reporting apply. Other unsupported file attachments and Notes galleries remain incomplete. See the validation report for reader and test evidence.
 
 ## Existing source (inspected)
 - `Apple Notes Exporter/Apple Notes Exporter/AppleNotesKit/`: C database/attachment parser. Preserve, read-only access.

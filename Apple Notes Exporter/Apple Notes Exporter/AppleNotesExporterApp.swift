@@ -136,6 +136,19 @@ class AppleNotesExporterState: ObservableObject {
     }
 }
 
+@MainActor
+private struct NotesSelectionUITestHost: View {
+    @ObservedObject var sharedState: AppleNotesExporterState
+    @EnvironmentObject private var notesViewModel: NotesViewModel
+    @State private var showSelector = true
+
+    var body: some View {
+        NoteSelectorView(sharedState: sharedState, showNoteSelectorView: $showSelector)
+            .environmentObject(notesViewModel)
+            .task { await notesViewModel.loadNotes() }
+    }
+}
+
 @main
 struct Apple_Notes_ExporterApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -150,6 +163,14 @@ struct Apple_Notes_ExporterApp: App {
     /// In that case we render an empty scene so the FDA / license dialog
     /// never opens; the unit-test bundle loads into the same process and
     /// runs against the imported types directly.
+    private static var isUITestFixtureMode: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    }
+
+    private static var isUITestExporterMainMode: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing-exporter-main")
+    }
+
     private static var isRunningUnderXCTest: Bool {
         return NSClassFromString("XCTestCase") != nil
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
@@ -157,9 +178,15 @@ struct Apple_Notes_ExporterApp: App {
     }
 
     init() {
-        // Initialize ViewModels first
-        let notesVM = NotesViewModel()
-        let exportVM = ExportViewModel()
+        // UI tests use only synthetic in-memory notes and never open the user's NoteStore.
+        let repository: NotesRepository
+        if Self.isUITestFixtureMode {
+            repository = Self.makeUITestRepository()
+        } else {
+            repository = DatabaseNotesRepository()
+        }
+        let notesVM = NotesViewModel(repository: repository)
+        let exportVM = ExportViewModel(repository: repository)
 
         // Create compatibility layer
         let state = AppleNotesExporterState(
@@ -167,16 +194,53 @@ struct Apple_Notes_ExporterApp: App {
             exportViewModel: exportVM
         )
 
+        if Self.isUITestFixtureMode {
+            state.licenseAccepted = true
+        }
         self.sharedState = state
         self._notesViewModel = StateObject(wrappedValue: notesVM)
         self._exportViewModel = StateObject(wrappedValue: exportVM)
     }
 
+    private static func makeUITestRepository() -> MockNotesRepository {
+        let repository = MockNotesRepository()
+        let accountID = "fixture-account"
+        let firstFolderID = "fixture-folder-projects"
+        let secondFolderID = "fixture-folder-research"
+        let created = Date(timeIntervalSince1970: 1_760_000_000)
+        let modified = Date(timeIntervalSince1970: 1_760_000_300)
+        repository.mockAccounts = [NotesAccount(
+            id: accountID,
+            name: "Synthetic Account",
+            identifier: "synthetic-account",
+            accountType: .local
+        )]
+        repository.mockFolders = [
+            NotesFolder(id: firstFolderID, name: "Projects", parentId: nil, accountId: accountID),
+            NotesFolder(id: secondFolderID, name: "Research", parentId: nil, accountId: accountID)
+        ]
+        repository.mockNotes = [
+            NotesNote(id: "fixture-note-alpha", title: "Synthetic Alpha", plaintext: "Fixture only", htmlBody: "<p>Fixture only</p>", creationDate: created, modificationDate: modified, folderId: firstFolderID, accountId: accountID, attachments: []),
+            NotesNote(id: "fixture-note-beta", title: "Synthetic Beta", plaintext: "Fixture only", htmlBody: "<p>Fixture only</p>", creationDate: created, modificationDate: modified, folderId: firstFolderID, accountId: accountID, attachments: []),
+            NotesNote(id: "fixture-note-gamma", title: "Synthetic Gamma", plaintext: "Fixture only", htmlBody: "<p>Fixture only</p>", creationDate: created, modificationDate: modified, folderId: secondFolderID, accountId: accountID, attachments: [])
+        ]
+        return repository
+    }
+
     var body: some Scene {
         WindowGroup(id: "main") {
-            if Self.isRunningUnderXCTest {
-                // Tests run inside this host process; do not bring up the UI
-                // or trigger Notes-DB / FDA work.
+            if Self.isUITestExporterMainMode {
+                AppleNotesExporterView(sharedState: sharedState)
+                    .environmentObject(notesViewModel)
+                    .environmentObject(exportViewModel)
+                    .onAppear { NSWindow.allowsAutomaticWindowTabbing = false }
+            } else if Self.isUITestFixtureMode {
+                NotesSelectionUITestHost(sharedState: sharedState)
+                    .environmentObject(notesViewModel)
+                    .frame(minWidth: 900, minHeight: 620)
+                    .onAppear { NSWindow.allowsAutomaticWindowTabbing = false }
+            } else if Self.isRunningUnderXCTest {
+                // Unit-test host: do not bring up the UI or trigger Notes-DB / FDA work.
                 EmptyView()
             } else {
                 AppleNotesExporterView(sharedState: sharedState)

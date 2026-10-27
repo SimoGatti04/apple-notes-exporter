@@ -19,6 +19,8 @@
 //
 
 import AppKit
+import Combine
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 import Foundation
@@ -67,6 +69,13 @@ struct AppleNotesExporterView: View {
         guard let format = ExportFormat(rawValue: outputFormat) else {
             return
         }
+        guard let destinationURL = outputURL else {
+            self.activeAlert = .noOutput
+            self.showAlert = true
+            return
+        }
+
+        let selectedNotes = notesViewModel.selectedNotes
 
         // Reset
         sharedState.update()
@@ -74,14 +83,20 @@ struct AppleNotesExporterView: View {
         // Show the export progress window
         setProgressWindow(true)
 
-        // Do the export using the new ExportViewModel
+        // A single PDF is a flat, non-overwriting deliverable in the chosen
+        // directory. Multi-note export keeps the established folder/archive
+        // planner and produces one PDF per note rather than merging them.
         Task {
-            await exportViewModel.exportNotes(
-                notesViewModel.selectedNotes,
-                toDirectory: outputURL!,
-                format: format,
-                includeAttachments: exportViewModel.configurations.includeAttachments
-            )
+            if format == .pdf, selectedNotes.count == 1 {
+                await exportViewModel.exportSingleNotePDF(selectedNotes[0], toDirectory: destinationURL)
+            } else {
+                await exportViewModel.exportNotes(
+                    selectedNotes,
+                    toDirectory: destinationURL,
+                    format: format,
+                    includeAttachments: exportViewModel.configurations.includeAttachments
+                )
+            }
         }
     }
     
@@ -99,6 +114,10 @@ struct AppleNotesExporterView: View {
         if exportViewModel.configurations.tarOutput { return .tar }
         if exportViewModel.configurations.concatenateOutput { return .singleFile }
         return .folder
+    }
+
+    private var isSingleNotePDFMode: Bool {
+        selectedFormat == .pdf && notesViewModel.selectedCount == 1
     }
 
     /// Forget the chosen destination when the container changes.
@@ -122,6 +141,7 @@ struct AppleNotesExporterView: View {
     /// archive and a single file are three different things to have not chosen,
     /// so the wording follows the container rather than always saying "folder".
     var missingDestinationTitle: String {
+        if isSingleNotePDFMode { return "No Output Folder Chosen" }
         if let archive = exportViewModel.configurations.archiveFormat {
             return "No \(archive.displayName) Location Chosen"
         }
@@ -132,6 +152,9 @@ struct AppleNotesExporterView: View {
     }
 
     var missingDestinationMessage: String {
+        if isSingleNotePDFMode {
+            return "Choose the folder where the single PDF should be saved."
+        }
         if let archive = exportViewModel.configurations.archiveFormat {
             return "Please choose where you would like the .\(archive.fileExtension) archive to be saved."
         }
@@ -151,6 +174,18 @@ struct AppleNotesExporterView: View {
     /// path under ZIP is fine, since the archive is named inside it.
     func normalizeOutputPathForContainer() {
         guard !outputPath.isEmpty else { return }
+        if isSingleNotePDFMode {
+            var isDirectory: ObjCBool = false
+            let isExistingDirectory = FileManager.default.fileExists(
+                atPath: outputPath,
+                isDirectory: &isDirectory
+            ) && isDirectory.boolValue
+            if !isExistingDirectory {
+                outputPath = ""
+                outputURL = nil
+            }
+            return
+        }
         let ext = (outputPath as NSString).pathExtension.lowercased()
         // Only extensions this app produces are treated as a filename; a
         // directory legitimately called "my.notes" must not be discarded.
@@ -178,6 +213,7 @@ struct AppleNotesExporterView: View {
     /// The filename and type to offer in a save panel, or nil when the
     /// container writes into a directory instead.
     func savePanelTarget() -> (name: String, type: UTType?)? {
+        guard !isSingleNotePDFMode else { return nil }
         if let archive = exportViewModel.configurations.archiveFormat {
             let name = "\(ExportViewModel.zipRootName).\(archive.fileExtension)"
             // .tar has no first-class UTType constant; resolve it by extension
@@ -193,8 +229,10 @@ struct AppleNotesExporterView: View {
     }
 
     func selectOutputFolder() {
-        // ZIP and Single File both produce exactly one file, so the user names
-        // that file rather than picking a directory to be filled.
+        // One-note PDF always writes a uniquely named PDF into a directory,
+        // regardless of advanced multi-note output-container preferences.
+        // ZIP and Single File otherwise produce exactly one file, so the user
+        // names that file rather than picking a directory to be filled.
         if let (suggestedName, contentType) = savePanelTarget() {
             let savePanel = NSSavePanel()
             if let contentType { savePanel.allowedContentTypes = [contentType] }
@@ -239,24 +277,26 @@ struct AppleNotesExporterView: View {
     // Data
     @ObservedObject private var sharedState: AppleNotesExporterState
     // Preferences (persisted across launches)
-    @AppStorage("outputFormat") private var outputFormat = "HTML"
+    @AppStorage("outputFormat") private var outputFormat = "PDF"
     @AppStorage("outputPath") private var outputPath: String = ""
     @State private var outputURL: URL? = nil
     // Show/hide different views.
     // Show license/permissions view on first launch OR when Full Disk Access has been
     // revoked since the last launch (e.g. user toggled it off in System Settings).
     @State private var showLicensePermissionsView: Bool = {
+        if ProcessInfo.processInfo.arguments.contains("--ui-testing-exporter-main") {
+            return false
+        }
         let licenseAccepted = UserDefaults.standard.bool(forKey: "licenseAcceptedGPLv3")
         return !licenseAccepted || !hasNotesDatabaseAccess()
     }()
     @State private var showNoteSelectorView: Bool = false
     @State private var showFormatOptionsView: Bool = false
+    @State private var showAdvancedOutputOptionsView: Bool = false
+    @State private var showPDFPreview: Bool = false
     @State private var showMCPSetupView: Bool = false
-    @State private var showProgressWindow: Bool = false
-    @State private var showErrorExportingAlert: Bool = false
     @State private var showAlert: Bool = false
     @State private var activeAlert: ActiveAlert = .noneSelected
-    @State private var showConfigurePopover: Bool = false
     @State private var showSyncWarning: Bool = false
     @State private var now: Date = Date()
     private let syncTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -284,169 +324,220 @@ struct AppleNotesExporterView: View {
     }
 
     // Body of the ContentView
-    var body: some View {
-        VStack {
-        VStack(alignment: .leading) {
-            Text("Step 1: Select Notes")
-                .font(.title)
-                .multilineTextAlignment(.leading).lineLimit(1)
-                .padding(.bottom, titleBottomPadding)
-            HStack() {
-                Image(systemName: "list.bullet.clipboard")
-                Text(notesViewModel.loadingState.isLoading ? "Querying database" : "\(self.sharedState.selectedNotesCount) note\(self.sharedState.selectedNotesCount == 1 ? "" : "s") from \(self.sharedState.fromAccountsCount) account\(self.sharedState.fromAccountsCount == 1 ? "" : "s")")
-                    .overlay(
-                        GeometryReader { geometry in
-                            if notesViewModel.loadingState.isLoading {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle())
-                                    .scaleEffect(0.5)
-                                    .offset(x: geometry.size.width + 2, y: -7)
-                            }
-                        }
-                    )
-                Spacer()
-                Button {
-                    showNoteSelectorView = true
-                } label: {
-                    Image(systemName: "scope")
-                    Text("Select")
+    private var selectedFormat: ExportFormat {
+        ExportFormat(rawValue: outputFormat) ?? .pdf
+    }
+
+    private var notesCard: some View {
+        Button { showNoteSelectorView = true } label: {
+            HStack(spacing: 16) {
+                Image(systemName: "book.closed")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundColor(.primary)
+                    .frame(width: 32)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Scegli le note")
+                        .font(.headline)
+                    Text(notesViewModel.loadingState.isLoading
+                         ? "Caricamento…"
+                         : selectionCountDescription)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    if let error = notesViewModel.loadingState.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .lineLimit(2)
+                    }
                 }
+
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            
-            Text("Step 2: Choose Export Format")
-                .font(.title)
-                .multilineTextAlignment(.leading)
-                .lineLimit(1)
-                .padding(.top, 5)
-                .padding(.bottom, titleBottomPadding)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 19)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("f", modifiers: [.command])
+        .disabled(notesViewModel.loadingState.isLoading)
+        .accessibilityIdentifier("noteSelectionButton")
+    }
 
-            // Format selector grid: 3 rows of 6
-            let columns = 6
-            let formats = ExportFormat.allCases
-            let rows = Int(ceil(Double(formats.count) / Double(columns)))
-            VStack(spacing: 4) {
-                ForEach(0..<rows, id: \.self) { row in
-                    HStack(spacing: selectionTileSpacing) {
-                        ForEach(0..<columns, id: \.self) { col in
-                            let index = row * columns + col
-                            if index < formats.count {
-                                let format = formats[index]
-                                let isSelected = outputFormat == format.rawValue
-                                Button(action: {
-                                    outputFormat = format.rawValue
-                                }) {
-                                    VStack(spacing: 3) {
-                                        Image(systemName: format.systemImage)
-                                            .font(.system(size: 16))
-                                            .frame(height: 20)
-                                        Text(format.rawValue)
-                                            .font(.system(size: 11, weight: .medium))
-                                    }
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .foregroundColor(isSelected ? .white : .secondary)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .fill(isSelected ? SwiftUI.Color.accentColor : SwiftUI.Color.clear)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .stroke(isSelected ? SwiftUI.Color.clear : SwiftUI.Color.gray.opacity(0.3), lineWidth: 1)
-                                )
-                                .animation(.easeInOut(duration: 0.15), value: isSelected)
-                            } else {
-                                // Empty placeholder to maintain grid alignment
-                                SwiftUI.Color.clear
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
+    private var selectionCountDescription: String {
+        let count = notesViewModel.selectedCount
+        return count == 1 ? "1 nota selezionata" : "\(count) note selezionate"
+    }
+
+    private var formatSection: some View {
+        HStack(alignment: .center, spacing: 16) {
+            Text(selectedFormat.rawValue)
+                .font(.system(size: 38, weight: .semibold, design: .rounded))
+                .accessibilityLabel("Formato: \(selectedFormat.rawValue)")
+
+            Spacer(minLength: 12)
+
+            Menu {
+                ForEach(ExportFormat.allCases, id: \.self) { format in
+                    Button {
+                        outputFormat = format.rawValue
+                    } label: {
+                        if format == selectedFormat {
+                            Label(format.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(format.rawValue)
                         }
                     }
                 }
+            } label: {
+                Label("Cambia formato", systemImage: "chevron.down")
+                    .labelStyle(.titleAndIcon)
             }
-            .frame(maxWidth: .infinity)
+            .menuStyle(.borderlessButton)
+            .accessibilityIdentifier("formatMenu")
+        }
+        .padding(.top, 2)
+    }
 
-            HStack {
-                Image(systemName: "info.circle")
-                    .foregroundColor(.secondary)
-                Text(ExportFormat(rawValue: outputFormat)?.blurb ?? "")
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .animation(.easeInOut(duration: 0.15), value: outputFormat)
+    private var pdfChoiceSections: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Aspetto")
+                    .font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    LargeSelectionButton(
+                        title: "Originale",
+                        subtitle: "Come in Note",
+                        systemImage: "doc.text",
+                        isSelected: exportViewModel.configurations.pdf.styleProfile == .faithful
+                    ) {
+                        exportViewModel.configurations.pdf.styleProfile = .faithful
+                    }
+                    .accessibilityIdentifier("pdfStyleFaithful")
 
-                Button {
-                    
-                    if ExportFormat(rawValue: outputFormat)?.hasOptionsSheet == true {
-                        showFormatOptionsView = true
-                    } else {
-                        showConfigurePopover = true
+                    LargeSelectionButton(
+                        title: "Per studiare",
+                        subtitle: "Più leggibile",
+                        systemImage: "book",
+                        isSelected: exportViewModel.configurations.pdf.styleProfile == .study
+                    ) {
+                        exportViewModel.configurations.pdf.styleProfile = .study
                     }
-                } label: {
-                    let isConfigurable = ExportFormat(rawValue: outputFormat)?.hasOptionsSheet == true
-                    Image(systemName: "gear")
-                        .foregroundColor(isConfigurable ? .primary : .secondary)
-                        .opacity(isConfigurable ? 1.0 : 0.8)
-                    Text("Options")
-                        .foregroundColor(isConfigurable ? .primary : .secondary)
-                        .opacity(isConfigurable ? 1.0 : 0.8)
-                }
-                .popover(isPresented: $showConfigurePopover, arrowEdge: .trailing) {
-                    VStack {
-                        Text("There are no configuration options available for this format.")
-                    }
-                    .frame(width: 240, height: 60)
+                    .accessibilityIdentifier("pdfStyleStudy")
                 }
             }
 
-            Text("Step 3: Choose Output Options")
-                .font(.title)
-                .multilineTextAlignment(.leading)
-                .lineLimit(1)
-                .padding(.top, 5)
-                .padding(.bottom, titleBottomPadding)
-            
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Allegati")
+                    .font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    LargeSelectionButton(
+                        title: "Con anteprima",
+                        subtitle: nil,
+                        systemImage: "photo",
+                        isSelected: exportViewModel.configurations.pdf.attachmentMode == .previewAndEmbed
+                    ) {
+                        exportViewModel.configurations.pdf.attachmentMode = .previewAndEmbed
+                    }
+                    .accessibilityIdentifier("pdfAttachmentPreview")
+
+                    LargeSelectionButton(
+                        title: "Solo file",
+                        subtitle: nil,
+                        systemImage: "paperclip",
+                        isSelected: exportViewModel.configurations.pdf.attachmentMode == .embedOnly
+                    ) {
+                        exportViewModel.configurations.pdf.attachmentMode = .embedOnly
+                    }
+                    .accessibilityIdentifier("pdfAttachmentOnly")
+                }
+            }
+        }
+    }
+
+    private var destinationCard: some View {
+        HStack(spacing: 14) {
+            Image(systemName: destinationSystemImage)
+                .font(.system(size: 21, weight: .medium))
+                .frame(width: 30)
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Destinazione")
+                    .font(.headline)
+                Text(destinationPathDescription)
+                    .font(.subheadline)
+                    .foregroundColor(outputPath.isEmpty ? .secondary : .primary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button(action: selectOutputFolder) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 42, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Cambia destinazione")
+            .accessibilityIdentifier("chooseDestinationButton")
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+        )
+    }
+
+    private var destinationSystemImage: String {
+        if isSingleNotePDFMode { return "folder" }
+        return exportViewModel.configurations.archiveFormat?.systemImage
+            ?? (exportViewModel.configurations.concatenateOutput ? "doc.text" : "folder")
+    }
+
+    private var destinationPathDescription: String {
+        outputPath.isEmpty ? "Scegli una cartella o un file" : outputPath
+    }
+
+    private var advancedOutputOptions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Output container")
+                .font(.subheadline.weight(.medium))
             HStack(spacing: selectionTileSpacing) {
-                let canConcatenate = ExportFormat(rawValue: outputFormat)?.supportsConcatenation ?? false
+                let canConcatenate = selectedFormat.supportsConcatenation
                 let isZip = exportViewModel.configurations.zipOutput
                 let isTar = exportViewModel.configurations.tarOutput && !isZip
                 let isArchive = isZip || isTar
                 let isSingle = exportViewModel.configurations.concatenateOutput && !isArchive
 
-                OutputContainerButton(
-                    title: "Folder",
-                    icon: "folder",
-                    isSelected: !isArchive && !isSingle
-                ) {
+                OutputContainerButton(title: "Folder", icon: "folder", isSelected: !isArchive && !isSingle) {
                     clearOutputPathIfContainerChanged(to: .folder)
                     exportViewModel.configurations.zipOutput = false
                     exportViewModel.configurations.tarOutput = false
                     exportViewModel.configurations.concatenateOutput = false
                     exportViewModel.saveConfigurations()
                 }
-                OutputContainerButton(
-                    title: "ZIP Archive",
-                    icon: "doc.zipper",
-                    isSelected: isZip
-                ) {
+                OutputContainerButton(title: "ZIP", icon: "doc.zipper", isSelected: isZip) {
                     clearOutputPathIfContainerChanged(to: .zip)
                     exportViewModel.configurations.zipOutput = true
                     exportViewModel.configurations.tarOutput = false
                     exportViewModel.configurations.concatenateOutput = false
-                    // A sync manifest has to live in a folder that persists
-                    // between runs, so it cannot travel inside an archive.
                     exportViewModel.configurations.incrementalSync = false
                     showSyncWarning = false
                     exportViewModel.saveConfigurations()
                 }
-                OutputContainerButton(
-                    title: "TAR Archive",
-                    icon: "shippingbox",
-                    isSelected: isTar
-                ) {
+                OutputContainerButton(title: "TAR", icon: "shippingbox", isSelected: isTar) {
                     clearOutputPathIfContainerChanged(to: .tar)
                     exportViewModel.configurations.tarOutput = true
                     exportViewModel.configurations.zipOutput = false
@@ -460,7 +551,7 @@ struct AppleNotesExporterView: View {
                     icon: "doc.text",
                     isSelected: isSingle,
                     isEnabled: canConcatenate,
-                    disabledHelp: "\(outputFormat) is a packaged format, so its notes cannot be joined into one file."
+                    disabledHelp: "\(selectedFormat.rawValue) is a packaged format, so notes cannot be joined into one file."
                 ) {
                     clearOutputPathIfContainerChanged(to: .singleFile)
                     exportViewModel.configurations.concatenateOutput = true
@@ -471,265 +562,298 @@ struct AppleNotesExporterView: View {
                     exportViewModel.saveConfigurations()
                 }
             }
-            .padding(.bottom, 6)
 
-            HStack() {
-                let destinationIcon = exportViewModel.configurations.archiveFormat?.systemImage
-                    ?? (exportViewModel.configurations.concatenateOutput ? "doc.text" : "folder")
-                let destinationLabel: String = {
-                    if let archive = exportViewModel.configurations.archiveFormat {
-                        let ext = archive.fileExtension
-                        guard outputPath != "" else { return "Choose where to save the archive" }
-                        if outputPath.lowercased().hasSuffix("." + ext) { return outputPath }
-                        return outputPath + "/\(ExportViewModel.zipRootName).\(ext)"
-                    }
-                    let format = ExportFormat(rawValue: outputFormat)
-                    let single = exportViewModel.configurations.concatenateOutput
-                        && (format?.supportsConcatenation ?? false)
-                    if single, let ext = format?.fileExtension {
-                        guard outputPath != "" else { return "Choose where to save the file" }
-                        if outputPath.lowercased().hasSuffix("." + ext) { return outputPath }
-                        return outputPath + "/\(concatenatedFileBaseName).\(ext)"
-                    }
-                    guard outputPath != "" else { return "Choose an output folder" }
-                    return outputPath
-                }()
+            Divider()
+            OutputOptionRow(
+                title: "Include attachments",
+                help: "Export images, PDFs, drawings, and other files attached to each note.",
+                isOn: $exportViewModel.configurations.includeAttachments
+            )
+            OutputOptionRow(
+                title: "Shared Attachments folder",
+                help: "Collect attachments in one top-level folder instead of beside each note.",
+                isOn: $exportViewModel.configurations.sharedAttachmentsFolder,
+                isEnabled: exportViewModel.configurations.includeAttachments
+            )
 
-                // Keying on the value makes each change a new view, so the old
-                // one fades out as the new one fades in. Animating the modifier
-                // alone would only move the view, not cross-fade its contents.
-                // Both isolate their geometry for the same reason the container
-                // buttons do, otherwise the transaction also shifts them and
-                // the text visibly jitters as it swaps.
-                // A transition is driven by the transaction in place when the
-                // view is inserted, which has to come from the parent: the
-                // incoming view does not exist yet to carry one itself. So the
-                // animation goes on the wrapper and the transition on the
-                // child, the same shape the checkbox rows and sync banner use.
-                // The wrapper is a ZStack so the outgoing and incoming views
-                // overlap and genuinely cross-fade instead of replacing.
-                ZStack {
-                    Image(systemName: destinationIcon)
-                        .id(destinationIcon)
-                        .transition(.opacity)
-                }
-                // folder, doc.zipper and doc.text are not the same width, so a
-                // fixed box keeps the path text from shifting as it swaps.
-                .frame(width: destinationIconSize.width, height: destinationIconSize.height)
-                .animation(.easeInOut(duration: 0.15), value: destinationIcon)
-                .isolatedGeometry()
-
-                ZStack(alignment: .leading) {
-                    Text(destinationLabel)
-                        .id(destinationLabel)
-                        .transition(.opacity)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(.easeInOut(duration: 0.15), value: destinationLabel)
-                .isolatedGeometry()
-                Button {
-                    selectOutputFolder()
-                } label: {
-                    Image(systemName: "folder.badge.plus")
-                    Text("Choose")
-                }
-            }
-
-            VStack(spacing: outputOptionRowSpacing) {
-                let isZip = exportViewModel.configurations.zipOutput || exportViewModel.configurations.tarOutput
-                let isSingle = exportViewModel.configurations.concatenateOutput && !isZip
-
-                OutputOptionRow(
-                    title: "Include attachments",
-                    help: "Export images, PDFs, drawings, and other files attached to each note.",
-                    isOn: $exportViewModel.configurations.includeAttachments
-                )
-
-                OutputOptionRow(
-                    title: "Shared Attachments folder",
-                    help: "Collect every attachment in one Attachments folder at the top level, instead of a folder beside each note.",
-                    isOn: $exportViewModel.configurations.sharedAttachmentsFolder,
-                    isEnabled: exportViewModel.configurations.includeAttachments
-                )
-
-                // Each conditional row sits in its own wrapper with its own
-                // animation, the way the sync banner below does. The wrapper is
-                // the only thing whose height changes, so it fades and resizes
-                // without handing a transaction to anything around it.
-                VStack(spacing: 0) {
-                    // One file the user already named: there is no per-note
-                    // filename for a date to prefix.
-                    if !isSingle {
-                        OutputOptionRow(
-                            title: "Add date to filename",
-                            help: "Prefix each exported file with the note's creation date, so files sort chronologically.",
-                            isOn: $exportViewModel.configurations.addDateToFilename
-                        ) {
-                            Picker("", selection: $exportViewModel.configurations.filenameDateFormat) {
-                                ForEach(FilenameDateFormat.allCases, id: \.self) { format in
-                                    Text(format.displayName).tag(format)
-                                }
-                            }
-                            .frame(width: 210)
-                            .opacity(exportViewModel.configurations.addDateToFilename ? 1 : 0)
-                            .disabled(!exportViewModel.configurations.addDateToFilename)
-                        }
-                        .transition(.opacity)
-                    }
-                }
-                .animation(.easeInOut(duration: 0.2), value: isSingle)
-
-                VStack(spacing: 0) {
-                    // A manifest has to persist in a folder between runs, so it
-                    // cannot travel inside an archive or a single joined file.
-                    if !isSingle && !isZip {
-                        OutputOptionRow(
-                            title: "Incremental sync",
-                            help: "Only export notes that are new or changed since the last export to this folder. Notes deleted from Apple Notes are removed from the output.",
-                            isOn: $exportViewModel.configurations.incrementalSync
-                        )
-                        .transition(.opacity)
-                    }
-                }
-                .animation(.easeInOut(duration: 0.2), value: isZip)
-                .animation(.easeInOut(duration: 0.2), value: isSingle)
-            }
-            .onChange(of: exportViewModel.configurations.addDateToFilename) { _ in exportViewModel.saveConfigurations() }
-            .onChange(of: exportViewModel.configurations.filenameDateFormat) { _ in exportViewModel.saveConfigurations() }
-            .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
-            .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
-            .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
-            .onChange(of: exportViewModel.configurations.incrementalSync) { _ in
-                exportViewModel.saveConfigurations()
-                showSyncWarning = exportViewModel.configurations.incrementalSync
-            }
-            .onChange(of: outputFormat) { newFormat in
-                // Auto-disable concatenation when switching to a format that doesn't support it
-                let supportsConcat = ExportFormat(rawValue: newFormat)?.supportsConcatenation ?? false
-                normalizeOutputPathForContainer()
-                if !supportsConcat && exportViewModel.configurations.concatenateOutput {
-                    // Fall back to Folder rather than leaving a selection the
-                    // new format cannot honour.
-                    exportViewModel.configurations.concatenateOutput = false
-                    exportViewModel.saveConfigurations()
-                }
-            }
-
-            // Sync overwrite warning
-            VStack {
-                if showSyncWarning {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.yellow)
-                        Text("Sync will overwrite previously exported files. Apple Notes is the source of truth.")
+            let isZip = exportViewModel.configurations.zipOutput || exportViewModel.configurations.tarOutput
+            let isSingle = exportViewModel.configurations.concatenateOutput && !isZip
+            let usesSingleFileLayout = exportViewModel.configurations.concatenateOutput
+                && selectedFormat.supportsConcatenation
+            if !usesSingleFileLayout && !exportViewModel.configurations.incrementalSync {
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Organizzazione")
+                            .font(.subheadline.weight(.medium))
+                        Text(exportViewModel.configurations.folderOrganization == .allTogether
+                             ? "Salva le note direttamente nella destinazione scelta."
+                             : "Conserva le cartelle e gli account di Note.")
                             .font(.caption)
-                            .foregroundColor(.primary)
+                            .foregroundColor(.secondary)
                     }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(SwiftUI.Color.orange.opacity(0.12))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(SwiftUI.Color.orange.opacity(0.35), lineWidth: 1)
-                    )
-                    // Fade only. A .move transition slides this banner, and
-                    // everything below it, every time the option is toggled.
-                    .transition(.opacity)
+                    Spacer(minLength: 8)
+                    Picker("Organizzazione", selection: $exportViewModel.configurations.folderOrganization) {
+                        Text("Tutte insieme").tag(ExportFolderOrganization.allTogether)
+                        Text("Come in Note").tag(ExportFolderOrganization.asInNotes)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 220)
+                    .accessibilityIdentifier("folderOrganizationPicker")
                 }
+                .padding(.vertical, 4)
             }
-            .animation(.easeInOut(duration: 0.2), value: showSyncWarning)
 
-            Text("Step 4: Export!")
-                .font(.title)
-                .multilineTextAlignment(.leading)
-                .lineLimit(1)
-                .padding(.top, 5)
-                .padding(.bottom, titleBottomPadding)
-            Button(action: {
-                triggerExportNotes()
-            }) {
-                Group {
-                    if #available(macOS 13.0, *) {
-                        Text(exportViewModel.configurations.incrementalSync ? "Sync (\(lastSyncedText))" : "Export")
-                            .frame(maxWidth: .infinity).font(.headline)
-                            .contentTransition(.opacity)
-                            .animation(.easeInOut(duration: 0.15), value: exportViewModel.configurations.incrementalSync)
-                    } else {
-                        Text(exportViewModel.configurations.incrementalSync ? "Sync (\(lastSyncedText))" : "Export")
-                            .frame(maxWidth: .infinity).font(.headline)
+            if !isSingle {
+                OutputOptionRow(
+                    title: "Add date to filename",
+                    help: "Prefix each exported file with the note's creation date.",
+                    isOn: $exportViewModel.configurations.addDateToFilename
+                ) {
+                    Picker("Date format", selection: $exportViewModel.configurations.filenameDateFormat) {
+                        ForEach(FilenameDateFormat.allCases, id: \.self) { format in
+                            Text(format.displayName).tag(format)
+                        }
                     }
+                    .frame(width: 190)
+                    .disabled(!exportViewModel.configurations.addDateToFilename)
                 }
             }
-            .buttonStyle(BorderedProminentButtonStyle())
-            .onReceive(syncTimer) { now = $0 }
-            
-            Text("Apple Notes Exporter v\(APP_VERSION) - Copyright © 2026 [Konstantin Zaremski](https://konstantin.zarem.ski) - Licensed under the [GNU GPL v3](https://raw.githubusercontent.com/kzaremski/apple-notes-exporter/main/LICENSE)")
-                .font(.footnote)
-                .multilineTextAlignment(.center)
-                .padding(.vertical, 5.0)
-                .pointerOnHover()
+            if !isSingle && !isZip {
+                OutputOptionRow(
+                    title: "Incremental sync",
+                    help: "Update changed notes in this folder and remove notes deleted from Apple Notes.",
+                    isOn: $exportViewModel.configurations.incrementalSync
+                )
+            }
         }
+        .padding(.top, 8)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 12) {
+                    Text("Apple Notes Exporter")
+                        .font(.title2.weight(.semibold))
+                    Spacer()
+
+                    Menu {
+                        if selectedFormat.hasOptionsSheet {
+                            Button("Preferenze formato…") { showFormatOptionsView = true }
+                        }
+                        Button("Opzioni avanzate…") { showAdvancedOutputOptionsView = true }
+                            .accessibilityIdentifier("advancedOutputOptionsButton")
+                        Divider()
+                        Button("Configurazione MCP…") { showMCPSetupView = true }
+                        Button("Permessi e licenza…") { showLicensePermissionsView = true }
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 18, weight: .medium))
+                            .frame(width: 38, height: 38)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityLabel("Impostazioni")
+                    .accessibilityIdentifier("settingsMenu")
+                }
+
+                notesCard
+
+                Divider()
+
+                formatSection
+                if selectedFormat == .pdf {
+                    pdfChoiceSections
+                }
+
+                destinationCard
+
+                if showSyncWarning {
+                    Label(
+                        "La sincronizzazione aggiorna i file già presenti. \(lastSyncedText)",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: 12) {
+                    Button {
+                        showPDFPreview = true
+                    } label: {
+                        Label("Anteprima", systemImage: "eye")
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 48)
+                    }
+                    .buttonStyle(.bordered)
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(
+                        selectedFormat != .pdf
+                            || notesViewModel.selectedCount == 0
+                            || notesViewModel.loadingState.isLoading
+                    )
+                    .accessibilityIdentifier("previewButton")
+
+                    Button(action: triggerExportNotes) {
+                        Label(
+                            exportButtonTitle,
+                            systemImage: "square.and.arrow.down"
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .font(.headline)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        notesViewModel.selectedCount == 0
+                            || outputPath.isEmpty
+                            || notesViewModel.loadingState.isLoading
+                    )
+                    .accessibilityIdentifier("exportButton")
+                }
+
+                if notesViewModel.selectedCount == 0 || outputPath.isEmpty {
+                    Text(notesViewModel.selectedCount == 0
+                         ? "Scegli almeno una nota per continuare."
+                         : "Scegli una destinazione per continuare.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(width: 500.0, alignment: .top)
-        .fixedSize(horizontal: false, vertical: true)
-        .padding(10.0)
+        .frame(minWidth: 540, idealWidth: 660, minHeight: 620, idealHeight: 720)
         .onAppear {
-            // Initialize sync warning state from persisted config
             showSyncWarning = exportViewModel.configurations.incrementalSync
-            // Restore output URL from persisted path, discarding one the
-            // current container cannot use.
             normalizeOutputPathForContainer()
             if !outputPath.isEmpty {
                 outputURL = URL(fileURLWithPath: outputPath)
             }
-            // If license was previously accepted, auto-load notes on launch
+            if ExportFormat(rawValue: outputFormat) == nil { outputFormat = "PDF" }
             if sharedState.licenseAccepted && !showLicensePermissionsView {
                 sharedState.reload()
             }
         }
-        .onReceive(sharedState.$triggerSelectNotes) { triggered in
+        .onChange(of: notesViewModel.selectedCount) { _ in
+            normalizeOutputPathForContainer()
+            sharedState.update()
+        }
+        .onReceive(syncTimer) { now = $0 }
+        .onChange(of: sharedState.triggerSelectNotes) { triggered in
             if triggered {
                 sharedState.triggerSelectNotes = false
                 showNoteSelectorView = true
             }
         }
-        .onReceive(sharedState.$triggerChooseFolder) { triggered in
+        .onChange(of: sharedState.triggerChooseFolder) { triggered in
             if triggered {
                 sharedState.triggerChooseFolder = false
                 selectOutputFolder()
             }
         }
-        .onReceive(sharedState.$triggerExport) { triggered in
+        .onChange(of: sharedState.triggerExport) { triggered in
             if triggered {
                 sharedState.triggerExport = false
                 triggerExportNotes()
             }
         }
-        .sheet(isPresented: $sharedState.showProgressWindow) {
-            ExportView(
-                sharedState: sharedState
-            )
-            .frame(width: 400)
-            .fixedSize(horizontal: false, vertical: true)
-            .allowsHitTesting(true)
-            .onAppear {
-                NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    // Detect Escape Key Press
-                    if event.keyCode == 53 {
-                        // Prevent Propagation
-                        return nil
-                    }
-                    return event
-                }
+        .onChange(of: sharedState.triggerMCPSetup) { trigger in
+            if trigger {
+                showMCPSetupView = true
+                sharedState.triggerMCPSetup = false
             }
         }
+        .onChange(of: outputFormat) { newFormat in
+            let supportsConcat = ExportFormat(rawValue: newFormat)?.supportsConcatenation ?? false
+            normalizeOutputPathForContainer()
+            if !supportsConcat && exportViewModel.configurations.concatenateOutput {
+                exportViewModel.configurations.concatenateOutput = false
+                exportViewModel.saveConfigurations()
+            }
+        }
+        .onChange(of: exportViewModel.configurations.addDateToFilename) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.filenameDateFormat) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.includeAttachments) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.folderOrganization) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.styleProfile) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.attachmentMode) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.fontFamily) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.marginSize) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.htmlConfiguration.marginUnit) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.pdf.pageSize) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.sharedAttachmentsFolder) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.folderOrganization) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.concatenateOutput) { _ in exportViewModel.saveConfigurations() }
+        .onChange(of: exportViewModel.configurations.incrementalSync) { _ in
+            exportViewModel.saveConfigurations()
+            showSyncWarning = exportViewModel.configurations.incrementalSync
+        }
+        .sheet(isPresented: $sharedState.showProgressWindow) {
+            ExportView(sharedState: sharedState)
+                .frame(width: 400)
+                .fixedSize(horizontal: false, vertical: true)
+                .allowsHitTesting(true)
+                .onAppear {
+                    NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                        event.keyCode == 53 ? nil : event
+                    }
+                }
+        }
+        .sheet(isPresented: $showNoteSelectorView) {
+            NoteSelectorView(sharedState: sharedState, showNoteSelectorView: $showNoteSelectorView)
+                .frame(width: 920, height: 620)
+        }
+        .sheet(isPresented: $showMCPSetupView) {
+            MCPSetupView(showMCPSetupView: $showMCPSetupView)
+        }
+        .sheet(isPresented: $showFormatOptionsView) {
+            if let format = ExportFormat(rawValue: outputFormat) {
+                FormatOptionsView(showOptionsView: $showFormatOptionsView, format: format)
+            }
+        }
+        .sheet(isPresented: $showAdvancedOutputOptionsView) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Opzioni avanzate")
+                        .font(.title2.weight(.semibold))
+                    Spacer()
+                    Button("Fine") {
+                        exportViewModel.saveConfigurations()
+                        showAdvancedOutputOptionsView = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+                Divider()
+                ScrollView {
+                    advancedOutputOptions
+                        .padding(.bottom, 18)
+                }
+            }
+            .padding(20)
+            .frame(minWidth: 520, idealWidth: 600, minHeight: 560, idealHeight: 680)
+        }
+        .sheet(isPresented: $showPDFPreview) {
+            PDFPreviewSheet(
+                notes: notesViewModel.selectedNotes,
+                exportViewModel: exportViewModel,
+                isPresented: $showPDFPreview
+            )
+            .frame(minWidth: 850, idealWidth: 1120, minHeight: 620, idealHeight: 780)
+        }
+        .sheet(isPresented: $showLicensePermissionsView) {
+            LicensePermissionsView(
+                sharedState: sharedState,
+                showLicensePermissionsView: $showLicensePermissionsView
+            )
+        }
         .alert(isPresented: $showAlert) {
-            switch self.activeAlert {
+            switch activeAlert {
             case .noneSelected:
                 Alert(
                     title: Text("No Notes Selected for Export"),
@@ -743,47 +867,372 @@ struct AppleNotesExporterView: View {
                     dismissButton: .default(Text("OK"))
                 )
             }
-            
         }
-        .sheet(isPresented: $showNoteSelectorView) {
-            NoteSelectorView(
-                sharedState: sharedState,
-                showNoteSelectorView: $showNoteSelectorView
-            ).frame(width: 600, height: 400)
-        }
-        .sheet(isPresented: $showMCPSetupView) {
-            MCPSetupView(showMCPSetupView: $showMCPSetupView)
-        }
-        .onChange(of: sharedState.triggerMCPSetup) { trigger in
-            if trigger {
-                showMCPSetupView = true
-                sharedState.triggerMCPSetup = false
-            }
-        }
-        .sheet(isPresented: $showFormatOptionsView) {
-            if let format = ExportFormat(rawValue: outputFormat) {
-                FormatOptionsView(
-                    showOptionsView: $showFormatOptionsView,
-                    format: format
-                )
-            }
-        }
-        .sheet(isPresented: $showLicensePermissionsView) {
-            LicensePermissionsView(
-                sharedState: sharedState,
-                showLicensePermissionsView: $showLicensePermissionsView
-            ).frame(width: 600, height: 400)
-            .onAppear {
-                NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    // Detect Escape Key Press
-                    if event.keyCode == 53 {
-                        // Prevent Propagation
-                        return nil
+    }
+
+    private var exportButtonTitle: String {
+        let count = notesViewModel.selectedCount
+        if exportViewModel.configurations.incrementalSync { return "Sincronizza" }
+        return count == 1 ? "Esporta 1 nota" : "Esporta \(count) note"
+    }
+
+}
+
+
+@MainActor
+private struct PDFPreviewSheet: View {
+    @ObservedObject private var exportViewModel: ExportViewModel
+    @StateObject private var previewModel: PDFPreviewViewModel
+    @State private var selectedNoteID: String?
+    @Binding private var isPresented: Bool
+
+    let notes: [NotesNote]
+
+    init(notes: [NotesNote], exportViewModel: ExportViewModel, isPresented: Binding<Bool>) {
+        self.notes = notes
+        self.exportViewModel = exportViewModel
+        _isPresented = isPresented
+        _selectedNoteID = State(initialValue: notes.first?.id)
+        _previewModel = StateObject(wrappedValue: PDFPreviewViewModel(exportViewModel: exportViewModel))
+    }
+
+    private var settingsKey: PDFPreviewSettingsKey {
+        PDFPreviewSettingsKey(configuration: exportViewModel.configurations.pdf)
+    }
+
+    private var selectedNote: NotesNote? {
+        notes.first(where: { $0.id == selectedNoteID }) ?? notes.first
+    }
+
+    private var noteIDs: [String] { notes.map(\.id) }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Preferenze")
+                        .font(.title2.weight(.semibold))
+
+                    Picker("Aspetto", selection: $exportViewModel.configurations.pdf.styleProfile) {
+                        Text("Originale").tag(PDFStyleProfile.faithful)
+                        Text("Per studiare").tag(PDFStyleProfile.study)
                     }
-                    return event
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("previewStylePicker")
+
+                    Picker("Allegati", selection: $exportViewModel.configurations.pdf.attachmentMode) {
+                        Text("Con anteprima").tag(PDFAttachmentMode.previewAndEmbed)
+                        Text("Solo file").tag(PDFAttachmentMode.embedOnly)
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("previewAttachmentPicker")
+
+                    Divider()
+
+                    Picker("Carattere", selection: $exportViewModel.configurations.pdf.htmlConfiguration.fontFamily) {
+                        ForEach(HTMLConfiguration.FontFamily.allCases, id: \.self) { family in
+                            Text(family.rawValue).tag(family)
+                        }
+                    }
+
+                    Stepper(
+                        value: $exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints,
+                        in: 8...32,
+                        step: 1
+                    ) {
+                        HStack {
+                            Text("Dimensione")
+                            Spacer(minLength: 8)
+                            Text("\(Int(exportViewModel.configurations.pdf.htmlConfiguration.fontSizePoints)) pt")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Picker("Margini", selection: $exportViewModel.configurations.pdf.htmlConfiguration.marginUnit) {
+                        ForEach(HTMLConfiguration.MarginUnit.allCases, id: \.self) { unit in
+                            Text(unit.displayName).tag(unit)
+                        }
+                    }
+
+                    Stepper(
+                        value: $exportViewModel.configurations.pdf.htmlConfiguration.marginSize,
+                        in: 0...96,
+                        step: 2
+                    ) {
+                        HStack {
+                            Text("Ampiezza")
+                            Spacer(minLength: 8)
+                            Text("\(Int(exportViewModel.configurations.pdf.htmlConfiguration.marginSize)) \(exportViewModel.configurations.pdf.htmlConfiguration.marginUnit.displayName)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Picker("Formato pagina", selection: $exportViewModel.configurations.pdf.pageSize) {
+                        ForEach(PDFConfiguration.PageSize.allCases, id: \.self) { size in
+                            Text(size.rawValue).tag(size)
+                        }
+                    }
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minWidth: 250, idealWidth: 300, maxWidth: 340)
+
+            Divider()
+
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("Anteprima")
+                        .font(.title2.weight(.semibold))
+
+                    if notes.count > 1 {
+                        Picker("Nota", selection: $selectedNoteID) {
+                            ForEach(notes, id: \.id) { note in
+                                Text(note.title).tag(Optional(note.id))
+                            }
+                        }
+                        .frame(maxWidth: 280)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Label(
+                        previewModel.isUpdating ? "Aggiornamento…" : "Aggiornamento automatico",
+                        systemImage: previewModel.isUpdating ? "arrow.triangle.2.circlepath" : "checkmark.circle"
+                    )
+                    .accessibilityIdentifier("pdfPreviewStatus")
+                    .font(.subheadline)
+                    .foregroundColor(previewModel.isUpdating ? .secondary : .green)
+
+                    Button {
+                        isPresented = false
+                    } label: {
+                        Label("Chiudi", systemImage: "xmark")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("pdfPreviewCloseButton")
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+
+                Divider()
+
+                Group {
+                    if notes.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 32))
+                                .foregroundColor(.secondary)
+                            Text("Nessuna nota selezionata")
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if let document = previewModel.document {
+                        PDFPreviewDocumentView(document: document)
+                            .id(selectedNote?.id)
+                            .accessibilityIdentifier("pdfPreviewDocument")
+                            .padding(18)
+                    } else if let error = previewModel.errorMessage {
+                        VStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 30))
+                                .foregroundColor(.orange)
+                            Text("Anteprima non disponibile")
+                                .font(.headline)
+                            Text(error)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(28)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                            Text("Preparazione dell’anteprima…")
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(SwiftUI.Color(nsColor: .underPageBackgroundColor))
+            }
+        }
+        .onAppear { refreshPreview() }
+        .onChange(of: selectedNoteID) { _ in refreshPreview() }
+        .onChange(of: noteIDs) { newIDs in
+            if !newIDs.contains(selectedNoteID ?? "") {
+                selectedNoteID = newIDs.first
+            }
+            refreshPreview()
+        }
+        .onChange(of: settingsKey) { _ in refreshPreview() }
+        .onDisappear { previewModel.cancel() }
+    }
+
+    private func refreshPreview() {
+        previewModel.schedule(for: selectedNote)
+    }
+}
+
+@MainActor
+private final class PDFPreviewViewModel: ObservableObject {
+    @Published private(set) var document: PDFDocument?
+    @Published private(set) var isUpdating = false
+    @Published private(set) var errorMessage: String?
+
+    private let exportViewModel: ExportViewModel
+    private var generationTask: Task<Void, Never>?
+    private var currentRequestID = UUID()
+
+    init(exportViewModel: ExportViewModel) {
+        self.exportViewModel = exportViewModel
+    }
+
+    func schedule(for note: NotesNote?) {
+        generationTask?.cancel()
+        let requestID = UUID()
+        currentRequestID = requestID
+        errorMessage = nil
+
+        guard let note else {
+            isUpdating = false
+            document = nil
+            return
+        }
+
+        isUpdating = true
+        generationTask = Task { [weak self, exportViewModel] in
+            do {
+                try await Task.sleep(nanoseconds: 350_000_000)
+                try Task.checkCancellation()
+                let data = try await exportViewModel.generatePDFPreviewData(for: note)
+                try Task.checkCancellation()
+                guard let self, self.currentRequestID == requestID else { return }
+                guard let document = PDFDocument(data: data) else {
+                    throw ExportError.invalidGeneratedPDF
+                }
+                self.document = document
+                self.errorMessage = nil
+                self.isUpdating = false
+            } catch is CancellationError {
+                guard let self, self.currentRequestID == requestID else { return }
+                self.isUpdating = false
+            } catch {
+                guard let self, self.currentRequestID == requestID else { return }
+                self.errorMessage = error.localizedDescription
+                self.isUpdating = false
+            }
+        }
+    }
+
+    func cancel() {
+        currentRequestID = UUID()
+        generationTask?.cancel()
+        generationTask = nil
+        isUpdating = false
+    }
+}
+
+private struct PDFPreviewSettingsKey: Equatable {
+    let fontFamily: String
+    let fontSizePoints: Double
+    let marginSize: Double
+    let marginUnit: String
+    let pageSize: String
+    let styleProfile: String
+    let attachmentMode: String
+
+    init(configuration: PDFConfiguration) {
+        fontFamily = configuration.htmlConfiguration.fontFamily.rawValue
+        fontSizePoints = configuration.htmlConfiguration.fontSizePoints
+        marginSize = configuration.htmlConfiguration.marginSize
+        marginUnit = configuration.htmlConfiguration.marginUnit.rawValue
+        pageSize = configuration.pageSize.rawValue
+        styleProfile = configuration.styleProfile.rawValue
+        attachmentMode = configuration.attachmentMode.rawValue
+    }
+}
+
+private struct PDFPreviewDocumentView: NSViewRepresentable {
+    let document: PDFDocument
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.displayDirection = .vertical
+        view.displaysPageBreaks = true
+        view.backgroundColor = .underPageBackgroundColor
+        view.document = document
+        return view
+    }
+
+    func updateNSView(_ view: PDFView, context: Context) {
+        guard view.document !== document else { return }
+
+        let currentPageIndex = view.document.flatMap { oldDocument in
+            view.currentPage.map(oldDocument.index(for:))
+        }
+        let previousScale = view.scaleFactor
+        let shouldPreserveScale = view.document != nil && previousScale > 0
+
+        view.document = document
+        view.autoScales = true
+        DispatchQueue.main.async {
+            view.layoutSubtreeIfNeeded()
+            if let currentPageIndex, document.pageCount > 0 {
+                let safePageIndex = min(currentPageIndex, document.pageCount - 1)
+                if let page = document.page(at: safePageIndex) { view.go(to: page) }
+            }
+            if shouldPreserveScale { view.scaleFactor = previousScale }
+        }
+    }
+}
+
+private struct LargeSelectionButton: View {
+    let title: String
+    let subtitle: String?
+    let systemImage: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 22, weight: .medium))
+                    .frame(height: 26)
+                Text(title)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: subtitle == nil ? 92 : 112)
+            .padding(.horizontal, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(SwiftUI.Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? SwiftUI.Color.accentColor : SwiftUI.Color.secondary.opacity(0.28),
+                        lineWidth: isSelected ? 2 : 1
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(isSelected ? "Selezionato" : "Non selezionato")
     }
 }
 
