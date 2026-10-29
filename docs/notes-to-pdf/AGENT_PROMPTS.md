@@ -1,3 +1,5 @@
+> **Archived prompts:** These prompts were used during the earlier P2 implementation. They are historical material, not current authorization or instructions to make changes. Check the [current project brief](README.md) and [roadmap](ROADMAP.md) before starting new work.
+
 # Ready-to-forward prompts for manual Codex agents
 
 Read [README](README.md), [ARCHITECTURE](ARCHITECTURE.md) and [PARALLEL_PLAN](PARALLEL_PLAN.md). **Start P0 first**; only launch A-D after P0 confirms an aligned base and dedicated worktrees. Do not run Codex Supervisor.

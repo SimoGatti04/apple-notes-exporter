@@ -11,6 +11,8 @@
 
 This is a local integration checkpoint only. No push, merge into `main`, release, or distribution was performed.
 
+> **Post-release status (2026-10-29):** This report is a historical integration checkpoint. Its statement that no push, merge, release, or distribution had occurred was accurate when this report was written on 2026-10-23; it is not the current repository status. PR #1 has since merged the Notes-to-PDF source into `main` (`c10febf5e70d0d8dbb9e65271c769c9916129840`), and the public prerelease `v0.1.0-beta.1` remains tied to build commit `61c89d99291b866141c0b2326aa87b303460ad2c`. The Beta artifacts are immutable for this maintenance checkpoint. Current user-facing limits and the two Release UI checks left NOT RUN are documented in [the release notes](RELEASE_NOTES_v0.1.0-beta.1.md) and [the roadmap](ROADMAP.md).
+
 ## 1. Objective and scope
 
 Integrate the parser, PDF-layout, export-output, and SwiftUI contributions into a coherent first Notes-to-PDF app flow; independently verify their commits and the shared seams; run the app/unit suite, inspect rendered PDF samples, and record unsupported behavior honestly.

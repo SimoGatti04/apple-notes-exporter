@@ -1,3 +1,5 @@
+> **Archived execution plan:** This file records the P2 integration work plan. It is retained for provenance, not as a current task list. The Notes-to-PDF Beta has since shipped; see the [current project brief](README.md) and [roadmap](ROADMAP.md).
+
 # Parallel development plan — manual Codex delegation
 
 Status: **P2 integration complete — READY WITH LIMITATIONS** on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). The four implementation commits are preserved as ancestors of the integration branch. P3 items (portable generic-file/gallery attachments, merged multi-note PDF, and real Notes/UI acceptance) remain deferred or unverified. This file retains the original plan and prompts as historical execution guidance.

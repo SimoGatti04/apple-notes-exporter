@@ -40,3 +40,12 @@ Automated tests and synthetic UI fixtures are the basis of the beta checks. They
 ## License and attribution
 
 This fork remains licensed under **GNU General Public License v3.0 or later (GPL-3.0-or-later)**. It is based on [apple-notes-exporter](https://github.com/kzaremski/apple-notes-exporter), originally built by **Konstantin Zaremski**. See `LICENSE` and `CONTRIBUTORS.txt` in the source repository for the full license and attribution history.
+
+## Post-release validation clarification (2026-10-29)
+
+The following two checks were explicitly **not run against the Release app UI**; they remain accepted residual risks, not passing tests:
+
+- Exporting two synthetic notes with **All together** directly into a user-chosen destination folder.
+- Embedding and extracting a synthetic PDF attachment end-to-end through the Release UI.
+
+The previously reported automated test results do not substitute for either interactive Release check. This clarification is maintained on `main`; it does not alter the frozen `v0.1.0-beta.1` tag, release description, DMG, or checksum.
