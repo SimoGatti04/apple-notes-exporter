@@ -1,3 +1,5 @@
+> **Historical design note:** This document records the P2 architecture checkpoint and may not describe every post-beta implementation detail. The released behavior and current limits are summarized in the [project brief](README.md) and [release notes](RELEASE_NOTES_v0.1.0-beta.1.md).
+
 # Architecture and integration contracts
 
 Status: design contract implemented through the P3 app integration checkpoint on `codex/notes-pdf-integration`; see [INTEGRATION_REPORT.md](INTEGRATION_REPORT.md). This is not a claim that every target capability below is implemented or that real-library/UI acceptance is complete. Change shared contracts only via integrator review, not concurrent agent edits.
